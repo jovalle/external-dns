@@ -227,3 +227,78 @@ class TestAdGuardURLHandling:
         provider = AdGuardDNSProvider(url="http://adguard.local/", username="", password="")
 
         assert provider._url == "http://adguard.local"
+
+
+class TestAdGuardJSONErrorHandling:
+    """Tests for AdGuard JSON error handling."""
+
+    def test_get_records_handles_malformed_json_response(self) -> None:
+        """Test get_records returns empty list on invalid JSON response."""
+        import json
+
+        provider = AdGuardDNSProvider(
+            url="http://adguard.local", username="admin", password="secret"
+        )
+
+        with patch.object(provider._session, "get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.side_effect = json.JSONDecodeError("Invalid", "", 0)
+            mock_get.return_value = mock_response
+
+            records = provider.get_records()
+
+            assert records == []
+
+    def test_get_records_skips_malformed_records(self) -> None:
+        """Test get_records continues parsing valid records when some are malformed."""
+        provider = AdGuardDNSProvider(
+            url="http://adguard.local", username="admin", password="secret"
+        )
+
+        mock_response_data = [
+            {"domain": "valid.example.com", "answer": "10.0.0.1"},
+            "not_a_dict",  # Malformed: not a dict
+            {"domain": "another.example.com", "answer": "10.0.0.2"},
+            123,  # Malformed: not a dict
+        ]
+
+        with patch.object(provider._session, "get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_response_data
+            mock_get.return_value = mock_response
+
+            records = provider.get_records()
+
+            assert len(records) == 2
+            assert records[0] == DNSRecord(domain="valid.example.com", answer="10.0.0.1")
+            assert records[1] == DNSRecord(domain="another.example.com", answer="10.0.0.2")
+
+    def test_get_records_handles_missing_fields(self) -> None:
+        """Test get_records skips records missing domain or answer fields."""
+        provider = AdGuardDNSProvider(
+            url="http://adguard.local", username="admin", password="secret"
+        )
+
+        mock_response_data = [
+            {"domain": "valid.example.com", "answer": "10.0.0.1"},
+            {"domain": "missing_answer.example.com"},  # Missing answer
+            {"answer": "10.0.0.2"},  # Missing domain
+            {"domain": None, "answer": "10.0.0.3"},  # None domain
+            {"domain": "null_answer.example.com", "answer": None},  # None answer
+            {"domain": 123, "answer": "10.0.0.4"},  # Non-string domain
+            {"domain": "nonstring_answer.example.com", "answer": 456},  # Non-string answer
+            {},  # Empty dict
+        ]
+
+        with patch.object(provider._session, "get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_response_data
+            mock_get.return_value = mock_response
+
+            records = provider.get_records()
+
+            assert len(records) == 1
+            assert records[0] == DNSRecord(domain="valid.example.com", answer="10.0.0.1")

@@ -449,3 +449,62 @@ class TestTraefikFilterMethods:
         provider = TraefikProxyProvider()
         router: dict = {}
         assert provider._has_middleware(router, "") is True
+
+
+class TestTraefikJSONErrorHandling:
+    """Tests for Traefik JSON error handling."""
+
+    def test_get_routes_handles_invalid_json(self) -> None:
+        """Test get_routes raises exception on malformed JSON response."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.side_effect = json.JSONDecodeError("Invalid", "", 0)
+            mock_get.return_value = mock_response
+
+            with pytest.raises(json.JSONDecodeError):
+                provider.get_routes(instance)
+
+    def test_get_routes_handles_non_list_response(self) -> None:
+        """Test get_routes returns empty list if response is not a list."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        # Test with dict instead of list
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = {"routers": []}  # Dict, not list
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+            assert routes == []
+
+    def test_get_routes_skips_non_dict_routers(self) -> None:
+        """Test get_routes continues processing when some router entries are invalid."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        mock_routers = [
+            {"name": "app1@docker", "rule": "Host(`app1.example.com`)"},
+            "not_a_dict",  # Invalid: string instead of dict
+            123,  # Invalid: integer instead of dict
+            None,  # Invalid: None instead of dict
+            {"name": "app2@docker", "rule": "Host(`app2.example.com`)"},
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            # Should only get 2 valid routes, skipping the 3 invalid entries
+            assert len(routes) == 2
+            hostnames = {r.hostname for r in routes}
+            assert hostnames == {"app1.example.com", "app2.example.com"}
