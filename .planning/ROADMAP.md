@@ -2,80 +2,16 @@
 
 ## Overview
 
-Harden the working external-dns prototype into a production-ready daemon. Focus on test coverage for sync logic correctness, robust error handling for real-world network conditions, and complete documentation for users and contributors.
+Production-ready daemon that synchronizes DNS records from Traefik routes to AdGuard Home. v1.0.0 shipped with comprehensive test coverage, robust error handling, and complete documentation.
 
-## Domain Expertise
+## Completed Milestones
 
-None
-
-## Phases
-
-**Phase Numbering:**
-- Integer phases (1, 2, 3): Planned milestone work
-- Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
-
-- [x] **Phase 1: Testing Foundation** - Comprehensive test coverage for sync logic and provider implementations (Complete: 3/3 plans)
-- [x] **Phase 2: Error Handling Hardening** - Retry logic, network failure handling, JSON parsing robustness (Complete: 3/3 plans)
-- [x] **Phase 3: Documentation & Release** - README accuracy, configuration reference, changelog maintenance (Complete: 1/1 plans)
-
-## Phase Details
-
-### Phase 1: Testing Foundation
-**Goal**: Achieve comprehensive test coverage for reconciliation logic and both providers (Traefik, AdGuard Home)
-**Depends on**: Nothing (first phase)
-**Research**: Unlikely (internal Python testing patterns)
-**Plans**: 3 plans
-
-Plans:
-- [x] 01-01: Sync reconciliation logic unit tests (ExternalDNSSyncer)
-- [x] 01-02: Provider unit tests (AdGuard, Traefik, StateStore)
-- [x] 01-03: Utility tests expansion and integration test documentation
-
-Key areas:
-- Sync reconciliation logic (add/update/delete, edge cases, ownership tracking)
-- Traefik provider (multi-instance, router filtering, zone detection)
-- AdGuard Home provider (CRUD operations, API interactions)
-- Integration tests for end-to-end sync scenarios
-
-### Phase 2: Error Handling Hardening
-**Goal**: Make the daemon resilient to transient failures and malformed data
-**Depends on**: Phase 1 (tests enable confident refactoring)
-**Research**: Unlikely (established Python error handling patterns)
-**Plans**: 3 plans
-
-Plans:
-- [x] 02-01: JSON parsing robustness (AdGuard/Traefik malformed response handling)
-- [x] 02-02: Retry logic with exponential backoff
-- [x] 02-03: Graceful degradation and error logging
-
-Key areas:
-- JSON parsing errors (malformed responses from Traefik/AdGuard APIs)
-- Network failures (connection timeouts, unreachable hosts, HTTP errors)
-- Retry logic with exponential backoff for transient failures
-- Graceful degradation when providers are temporarily unavailable
-
-### Phase 3: Documentation & Release
-**Goal**: Complete documentation and establish version hygiene for ongoing maintenance
-**Depends on**: Phase 2 (document hardened behavior)
-**Research**: Unlikely (internal documentation work)
-**Plans**: 1 plan
-
-Plans:
-- [x] 03-01: README env var reference, CHANGELOG population, CONTRIBUTING enhancements
-
-Key areas:
-- README accuracy (ensure docs match current implementation)
-- Configuration reference (all environment variables documented)
-- Changelog maintenance (semantic versioning, release notes)
-- Contributing guide updates
+- [v1.0.0 Production Ready](milestones/v1.0.0-ROADMAP.md) (Phases 1-3) — SHIPPED 2025-12-29
 
 ## Progress
 
-**Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3
-
-| Phase | Plans Complete | Status | Completed |
-|-------|----------------|--------|-----------|
-| 1. Testing Foundation | 3/3 | Complete | 2025-12-29 |
-| 2. Error Handling Hardening | 3/3 | Complete | 2025-12-29 |
-| 3. Documentation & Release | 1/1 | Complete | 2025-12-29 |
+| Phase | Milestone | Plans Complete | Status | Completed |
+|-------|-----------|----------------|--------|-----------|
+| 1. Testing Foundation | v1.0.0 | 3/3 | Complete | 2025-12-29 |
+| 2. Error Handling Hardening | v1.0.0 | 3/3 | Complete | 2025-12-29 |
+| 3. Documentation & Release | v1.0.0 | 1/1 | Complete | 2025-12-29 |

@@ -28,17 +28,18 @@ Sync correctness: DNS records always match Traefik routes — no orphans, no mis
 - ✓ Semantic release workflow — existing
 - ✓ Domain exclusion patterns (exact, wildcard, regex) — existing
 - ✓ Static rewrites support — existing
+- ✓ Comprehensive test coverage for sync logic (121 tests) — v1.0.0
+- ✓ Comprehensive test coverage for provider implementations — v1.0.0
+- ✓ Error handling hardening (JSON parsing, network failures) — v1.0.0
+- ✓ Retry logic with exponential backoff for transient failures — v1.0.0
+- ✓ Complete documentation (README, configuration reference) — v1.0.0
+- ✓ Changelog maintenance and version hygiene — v1.0.0
 
 ### Active
 
 <!-- Current scope. Building toward these. -->
 
-- [ ] Comprehensive test coverage for sync logic (reconciliation, edge cases)
-- [ ] Comprehensive test coverage for provider implementations
-- [ ] Error handling hardening (JSON parsing, network failures, malformed responses)
-- [ ] Retry logic with exponential backoff for transient failures
-- [ ] Complete documentation (README accuracy, configuration reference)
-- [ ] Changelog maintenance and version hygiene
+(None — v1.0.0 complete)
 
 ### Out of Scope
 
@@ -55,10 +56,12 @@ Fortune 100 infrastructure context. Multiple Docker hosts running Traefik for au
 
 This is a common pairing (Traefik + AdGuard Home) in homelab and small infrastructure contexts. Getting this right means the foundation is solid before expanding to other providers.
 
-**Current state:** Working prototype with core functionality. Needs hardening:
-- Test coverage is minimal (6 unit tests, 1 integration test for 1,235 lines)
-- Some error handling gaps identified in codebase analysis
-- Project hygiene incomplete (docs need updates, changelog workflow)
+**Current state (v1.0.0):** Production-ready daemon with:
+- 121 unit tests covering sync logic, providers, and utilities
+- Retry logic with exponential backoff for all HTTP calls
+- Graceful degradation — watch mode continues through errors
+- Complete documentation (all 18 env vars, changelog, contributing guide)
+- 4,332 lines of Python
 
 **Codebase map:** `.planning/codebase/` contains 7 analysis documents from 2025-12-28.
 
@@ -74,11 +77,13 @@ This is a common pairing (Traefik + AdGuard Home) in homelab and small infrastru
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Single-file monolithic module | Simplifies deployment, no import complexity | — Pending |
+| Single-file monolithic module | Simplifies deployment, no import complexity | ✓ Good — worked well with 1,500 LOC |
 | Provider pattern with ABCs | Enables future extensibility without core changes | ✓ Good |
 | Environment variable config | Works well in containerized/k8s environments | ✓ Good |
-| JSON state file | Simple persistence, human-readable for debugging | — Pending |
-| Polling-based watch mode | Portable, works without inotify/fsevents | — Pending |
+| JSON state file | Simple persistence, human-readable for debugging | ✓ Good — state preserved across restarts |
+| Polling-based watch mode | Portable, works without inotify/fsevents | ✓ Good — reliable operation |
+| Retry with exponential backoff | Handle transient network failures gracefully | ✓ Good — v1.0.0 |
+| Graceful degradation in watch mode | Never crash on recoverable errors | ✓ Good — v1.0.0 |
 
 ---
-*Last updated: 2025-12-28 after initialization*
+*Last updated: 2025-12-29 after v1.0.0 milestone*
