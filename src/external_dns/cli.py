@@ -373,7 +373,10 @@ class AdGuardDNSProvider(DNSProvider):
             logger.info(f"{self.name} connection successful")
             return result
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to connect to {self.name}: {e}")
+            status_info = ""
+            if hasattr(e, "response") and e.response is not None:
+                status_info = f" (HTTP {e.response.status_code})"
+            logger.error(f"Failed to connect to {self.name} at {self._url}{status_info}: {e}")
             return False
 
     def get_records(self) -> List[DNSRecord]:
@@ -385,7 +388,10 @@ class AdGuardDNSProvider(DNSProvider):
         try:
             data = retry_with_backoff(_do_request, max_retries=2, base_delay=1.0)
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-            logger.error(f"Failed to get records from {self.name}: {e}")
+            status_info = ""
+            if hasattr(e, "response") and e.response is not None:
+                status_info = f" (HTTP {e.response.status_code})"
+            logger.error(f"Failed to get records from {self.name} at {self._url}{status_info}: {e}")
             return []
 
         records = []
@@ -410,7 +416,10 @@ class AdGuardDNSProvider(DNSProvider):
             logger.info(f"Added DNS record: {domain} -> {answer}")
             return True
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to add record for {domain}: {e}")
+            status_info = ""
+            if hasattr(e, "response") and e.response is not None:
+                status_info = f" (HTTP {e.response.status_code})"
+            logger.error(f"Failed to add record for {domain} at {self._url}{status_info}: {e}")
             return False
 
     def delete_record(self, domain: str, answer: str) -> bool:
@@ -427,7 +436,10 @@ class AdGuardDNSProvider(DNSProvider):
             logger.info(f"Deleted DNS record: {domain} -> {answer}")
             return True
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to delete record for {domain}: {e}")
+            status_info = ""
+            if hasattr(e, "response") and e.response is not None:
+                status_info = f" (HTTP {e.response.status_code})"
+            logger.error(f"Failed to delete record for {domain} at {self._url}{status_info}: {e}")
             return False
 
 
@@ -729,16 +741,20 @@ class TraefikProxyProvider(ReverseProxyProvider):
 
 def create_dns_provider() -> DNSProvider:
     """Factory function to create the configured DNS provider."""
+    supported = ["adguard"]
     if DNS_PROVIDER == "adguard":
         return AdGuardDNSProvider(ADGUARD_URL, ADGUARD_USERNAME, ADGUARD_PASSWORD)
     else:
         raise ValueError(
-            f"Unsupported DNS provider: '{DNS_PROVIDER}'. Supported providers: adguard"
+            f"Unsupported DNS_PROVIDER: '{DNS_PROVIDER}'. "
+            f"Supported providers: {', '.join(supported)}. "
+            f"Check your DNS_PROVIDER environment variable."
         )
 
 
 def create_proxy_provider() -> ReverseProxyProvider:
     """Factory function to create the configured reverse proxy provider."""
+    supported = ["traefik"]
     if PROXY_PROVIDER == "traefik":
         return TraefikProxyProvider(
             config_path=TRAEFIK_CONFIG_PATH,
@@ -750,7 +766,9 @@ def create_proxy_provider() -> ReverseProxyProvider:
         )
     else:
         raise ValueError(
-            f"Unsupported reverse proxy provider: '{PROXY_PROVIDER}'. Supported providers: traefik"
+            f"Unsupported PROXY_PROVIDER: '{PROXY_PROVIDER}'. "
+            f"Supported providers: {', '.join(supported)}. "
+            f"Check your PROXY_PROVIDER environment variable."
         )
 
 
@@ -1023,13 +1041,18 @@ class ExternalDNSSyncer:
             except requests.exceptions.RequestException as e:
                 instance_success[instance.name] = False
                 instance_seen_domains[instance.name] = set()
+                error_detail = str(e)
+                if hasattr(e, "response") and e.response is not None:
+                    error_detail = f"HTTP {e.response.status_code}: {e}"
                 prev = state["instances"].get(instance.name, {})
                 state["instances"][instance.name] = {
                     "last_success": prev.get("last_success", 0),
-                    "last_error": str(e),
+                    "last_error": error_detail,
                     "url": instance.url,
                 }
-                logger.warning(f"Proxy instance '{instance.name}' unreachable: {e}")
+                logger.warning(
+                    f"Proxy instance '{instance.name}' ({instance.url}) unreachable: {error_detail}"
+                )
 
         # Prune sources ONLY for instances that were successfully polled.
         domains_to_delete_from_state: List[str] = []
@@ -1197,9 +1220,11 @@ def main():
     proxy_provider = create_proxy_provider()
     instances = proxy_provider.get_instances()
 
-    logger.info(f"DNS Provider: {dns_provider.name}")
+    logger.info(f"DNS Provider: {dns_provider.name} ({ADGUARD_URL})")
     logger.info(f"Proxy Provider: {proxy_provider.name}")
-    logger.info(f"Proxy instances: {', '.join([i.name for i in instances])}")
+    logger.info(f"Configured {len(instances)} proxy instance(s):")
+    for inst in instances:
+        logger.info(f"  - {inst.name}: {inst.url} -> {inst.target_ip}")
     logger.info(
         f"Default zone: {EXTERNAL_DNS_DEFAULT_ZONE} (only 'internal' zones sync to local DNS)"
     )
@@ -1252,9 +1277,22 @@ def main():
         config_files = find_config_files(TRAEFIK_CONFIG_PATH)
         last_config_mtimes = get_config_files_mtimes(config_files)
 
+        # Cycle counter for health check logging
+        cycle_count = 0
+
         # Polling loop with config file watching
         while True:
-            syncer.sync_once()
+            cycle_count += 1
+            try:
+                syncer.sync_once()
+            except Exception as e:
+                logger.error(f"Sync cycle {cycle_count} failed: {e}", exc_info=True)
+                # Continue to next cycle - don't crash the daemon
+                # State is preserved from last successful sync
+
+            # Periodic health check logging
+            if cycle_count % 10 == 0:
+                logger.info(f"Health check: {cycle_count} sync cycles completed")
 
             # Check for new config files or changes to existing ones
             current_config_files = find_config_files(TRAEFIK_CONFIG_PATH)

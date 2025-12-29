@@ -661,3 +661,171 @@ def test_sync_handles_multiple_domains_from_single_instance(tmp_path: Path) -> N
     assert records.get("app1.example.com") == "10.0.0.1"
     assert records.get("app2.example.com") == "10.0.0.1"
     assert records.get("app3.example.com") == "10.0.0.1"
+
+
+# =============================================================================
+# Graceful Degradation Tests
+# =============================================================================
+
+
+def test_sync_continues_when_dns_provider_unavailable(tmp_path: Path) -> None:
+    """DNS provider errors should be logged but not crash sync."""
+    instances = [make_instance("core")]
+    routes = {"core": [make_route("app.example.com", "10.0.0.1")]}
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+
+    # Make DNS provider return errors
+    def failing_add(domain: str, answer: str) -> bool:
+        dns.add_calls.append((domain, answer))
+        return False  # Simulate failure
+
+    dns.add_record = failing_add  # type: ignore[method-assign]
+
+    # sync_once should complete without raising
+    syncer.sync_once()
+
+    # Verify the attempt was made
+    assert ("app.example.com", "10.0.0.1") in dns.add_calls
+
+    # State file should still be saved
+    state = syncer.state_store.load()
+    assert "instances" in state
+    assert "domains" in state
+
+
+def test_sync_handles_all_instances_failing(tmp_path: Path) -> None:
+    """All proxy instances failing should preserve state and not crash."""
+    initial_records = [
+        DNSRecord("app1.example.com", "10.0.0.1"),
+        DNSRecord("app2.example.com", "10.0.0.2"),
+    ]
+    instances = [make_instance("core", "10.0.0.1"), make_instance("edge", "10.0.0.2")]
+    routes = {
+        "core": [make_route("app1.example.com", "10.0.0.1")],
+        "edge": [make_route("app2.example.com", "10.0.0.2")],
+    }
+
+    # Pre-populate state
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {
+                "core": {"last_success": 1000, "last_error": "", "url": "http://core:8080"},
+                "edge": {"last_success": 1000, "last_error": "", "url": "http://edge:8080"},
+            },
+            "domains": {
+                "app1.example.com": {
+                    "sources": {"core": {"answer": "10.0.0.1", "last_seen": 1000}}
+                },
+                "app2.example.com": {
+                    "sources": {"edge": {"answer": "10.0.0.2", "last_seen": 1000}}
+                },
+            },
+        }
+    )
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        dns_records=initial_records,
+        proxy_instances=instances,
+        proxy_routes=routes,
+        failing_instances={"core", "edge"},  # All instances fail
+    )
+
+    # sync_once should complete without raising
+    syncer.sync_once()
+
+    # Records should NOT be deleted (instances are failing)
+    assert ("app1.example.com", "10.0.0.1") not in dns.delete_calls
+    assert ("app2.example.com", "10.0.0.2") not in dns.delete_calls
+
+    # State should be preserved with error info
+    state = syncer.state_store.load()
+    assert "core" in state["instances"]
+    assert "edge" in state["instances"]
+    assert state["instances"]["core"]["last_error"] != ""
+    assert state["instances"]["edge"]["last_error"] != ""
+
+
+def test_sync_recovers_after_transient_failure(tmp_path: Path) -> None:
+    """Instance that fails then succeeds should sync correctly on recovery."""
+    instances = [make_instance("core", "10.0.0.1")]
+    routes = {"core": [make_route("app.example.com", "10.0.0.1")]}
+
+    # Pre-populate state with previous error
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {
+                "core": {
+                    "last_success": 500,
+                    "last_error": "Connection refused",
+                    "url": "http://core:8080",
+                }
+            },
+            "domains": {
+                "app.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 500}}}
+            },
+        }
+    )
+
+    # Create syncer with working instance (no longer failing)
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        proxy_instances=instances,
+        proxy_routes=routes,
+        failing_instances=set(),  # No failures now
+    )
+
+    syncer.sync_once()
+
+    # Instance should recover - last_error should be cleared
+    state = syncer.state_store.load()
+    assert state["instances"]["core"]["last_error"] == ""
+    assert state["instances"]["core"]["last_success"] > 500
+
+    # Record should still exist (either kept or re-added if needed)
+    records = {r.domain: r.answer for r in dns.get_records()}
+    assert records.get("app.example.com") == "10.0.0.1"
+
+
+def test_sync_state_not_corrupted_on_partial_failure(tmp_path: Path) -> None:
+    """Partial failures should not corrupt state file."""
+    instances = [make_instance("core", "10.0.0.1"), make_instance("edge", "10.0.0.2")]
+    routes = {
+        "core": [make_route("app1.example.com", "10.0.0.1")],
+        "edge": [make_route("app2.example.com", "10.0.0.2")],
+    }
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        proxy_instances=instances,
+        proxy_routes=routes,
+        failing_instances={"edge"},  # Only edge fails
+    )
+
+    syncer.sync_once()
+
+    # State should be valid JSON and contain expected structure
+    state = syncer.state_store.load()
+    assert state["version"] == 1
+    assert "instances" in state
+    assert "domains" in state
+
+    # core instance should have succeeded
+    assert state["instances"]["core"]["last_error"] == ""
+    assert state["instances"]["core"]["last_success"] > 0
+
+    # edge instance should have failed
+    assert "edge" in state["instances"]
+    assert state["instances"]["edge"]["last_error"] != ""
+
+    # app1 domain from core should be in state
+    assert "app1.example.com" in state["domains"]

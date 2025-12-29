@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import requests
 
 from external_dns.cli import (
@@ -434,3 +435,58 @@ def test_find_config_files_sorted_alphabetically() -> None:
         # Should be sorted
         filenames = [Path(p).name for p in result]
         assert filenames == ["a_config.yaml", "m_config.yaml", "z_config.yaml"]
+
+
+# =============================================================================
+# Provider Factory Error Message Tests
+# =============================================================================
+
+
+def test_create_dns_provider_error_message_includes_suggestions() -> None:
+    """Error message for invalid DNS provider includes supported list and env var hint."""
+    from external_dns import cli
+
+    # Save original value
+    original_value = cli.DNS_PROVIDER
+
+    try:
+        # Set invalid provider
+        cli.DNS_PROVIDER = "invalid_provider"
+
+        with pytest.raises(ValueError) as exc_info:
+            cli.create_dns_provider()
+
+        error_message = str(exc_info.value)
+
+        # Check that error message includes helpful information
+        assert "invalid_provider" in error_message
+        assert "adguard" in error_message.lower()  # supported provider
+        assert "DNS_PROVIDER" in error_message  # env var hint
+    finally:
+        # Restore original value
+        cli.DNS_PROVIDER = original_value
+
+
+def test_create_proxy_provider_error_message_includes_suggestions() -> None:
+    """Error message for invalid proxy provider includes supported list and env var hint."""
+    from external_dns import cli
+
+    # Save original value
+    original_value = cli.PROXY_PROVIDER
+
+    try:
+        # Set invalid provider
+        cli.PROXY_PROVIDER = "nginx"
+
+        with pytest.raises(ValueError) as exc_info:
+            cli.create_proxy_provider()
+
+        error_message = str(exc_info.value)
+
+        # Check that error message includes helpful information
+        assert "nginx" in error_message
+        assert "traefik" in error_message.lower()  # supported provider
+        assert "PROXY_PROVIDER" in error_message  # env var hint
+    finally:
+        # Restore original value
+        cli.PROXY_PROVIDER = original_value
