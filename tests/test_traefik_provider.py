@@ -508,3 +508,33 @@ class TestTraefikJSONErrorHandling:
             assert len(routes) == 2
             hostnames = {r.hostname for r in routes}
             assert hostnames == {"app1.example.com", "app2.example.com"}
+
+
+class TestTraefikRetryBehavior:
+    """Tests for Traefik retry behavior on transient failures."""
+
+    def test_get_routes_retries_on_transient_failure(self) -> None:
+        """Test that get_routes retries on transient failure and succeeds."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        call_count = 0
+        mock_routers = [{"name": "app@docker", "rule": "Host(`app.example.com`)"}]
+
+        def mock_get_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise requests.exceptions.ConnectionError("Connection refused")
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            return mock_response
+
+        with patch("requests.Session.get", side_effect=mock_get_side_effect):
+            with patch("external_dns.cli.time.sleep"):  # Skip sleep delays
+                routes = provider.get_routes(instance)
+
+        assert len(routes) == 1
+        assert routes[0].hostname == "app.example.com"
+        assert call_count == 2  # First failed, second succeeded

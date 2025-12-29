@@ -302,3 +302,82 @@ class TestAdGuardJSONErrorHandling:
 
             assert len(records) == 1
             assert records[0] == DNSRecord(domain="valid.example.com", answer="10.0.0.1")
+
+
+class TestAdGuardRetryBehavior:
+    """Tests for AdGuard retry behavior on transient failures."""
+
+    def test_test_connection_retries_on_transient_failure(self) -> None:
+        """Test that test_connection retries on transient failure and succeeds."""
+        provider = AdGuardDNSProvider(
+            url="http://adguard.local", username="admin", password="secret"
+        )
+
+        call_count = 0
+
+        def mock_get_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise requests.exceptions.ConnectionError("Connection refused")
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            return mock_response
+
+        with patch.object(provider._session, "get", side_effect=mock_get_side_effect):
+            with patch("external_dns.cli.time.sleep"):  # Skip sleep delays
+                result = provider.test_connection()
+
+        assert result is True
+        assert call_count == 2  # First failed, second succeeded
+
+    def test_get_records_retries_on_transient_failure(self) -> None:
+        """Test that get_records retries on transient failure and succeeds."""
+        provider = AdGuardDNSProvider(
+            url="http://adguard.local", username="admin", password="secret"
+        )
+
+        call_count = 0
+        mock_response_data = [{"domain": "app.example.com", "answer": "10.0.0.1"}]
+
+        def mock_get_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise requests.exceptions.ConnectionError("Connection refused")
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_response_data
+            return mock_response
+
+        with patch.object(provider._session, "get", side_effect=mock_get_side_effect):
+            with patch("external_dns.cli.time.sleep"):  # Skip sleep delays
+                records = provider.get_records()
+
+        assert len(records) == 1
+        assert records[0] == DNSRecord(domain="app.example.com", answer="10.0.0.1")
+        assert call_count == 2
+
+    def test_add_record_retries_on_transient_failure(self) -> None:
+        """Test that add_record retries on transient failure and succeeds."""
+        provider = AdGuardDNSProvider(
+            url="http://adguard.local", username="admin", password="secret"
+        )
+
+        call_count = 0
+
+        def mock_post_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise requests.exceptions.ConnectionError("Connection refused")
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            return mock_response
+
+        with patch.object(provider._session, "post", side_effect=mock_post_side_effect):
+            with patch("external_dns.cli.time.sleep"):  # Skip sleep delays
+                result = provider.add_record("app.example.com", "10.0.0.1")
+
+        assert result is True
+        assert call_count == 2

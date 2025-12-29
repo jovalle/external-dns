@@ -107,11 +107,59 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
 
 import requests
 import yaml
 from requests.auth import HTTPBasicAuth
+
+T = TypeVar("T")
+
+# =============================================================================
+# Retry Utilities
+# =============================================================================
+
+
+def retry_with_backoff(
+    func: Callable[[], T],
+    *,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    exponential_base: float = 2.0,
+    retryable_exceptions: tuple = (requests.exceptions.RequestException,),
+) -> T:
+    """Retry a function with exponential backoff.
+
+    Args:
+        func: Zero-argument callable to retry
+        max_retries: Maximum number of retry attempts (0 = no retries)
+        base_delay: Initial delay between retries in seconds
+        max_delay: Maximum delay cap in seconds
+        exponential_base: Base for exponential backoff calculation
+        retryable_exceptions: Tuple of exception types that trigger retry
+
+    Returns:
+        Result of successful function call
+
+    Raises:
+        Last exception if all retries exhausted
+    """
+    last_exception: Optional[Exception] = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            return func()
+        except retryable_exceptions as e:
+            last_exception = e
+            if attempt == max_retries:
+                break
+            delay = min(base_delay * (exponential_base**attempt), max_delay)
+            logger.debug(f"Retry {attempt + 1}/{max_retries} after {delay:.1f}s: {e}")
+            time.sleep(delay)
+
+    raise last_exception  # type: ignore[misc]
+
 
 # =============================================================================
 # File Watching Utilities
@@ -315,20 +363,27 @@ class AdGuardDNSProvider(DNSProvider):
         return "AdGuard Home"
 
     def test_connection(self) -> bool:
-        try:
+        def _do_request() -> bool:
             response = self._session.get(f"{self._url}/control/status", timeout=5)
             response.raise_for_status()
-            logger.info(f"{self.name} connection successful")
             return True
+
+        try:
+            result = retry_with_backoff(_do_request, max_retries=2, base_delay=1.0)
+            logger.info(f"{self.name} connection successful")
+            return result
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to connect to {self.name}: {e}")
             return False
 
     def get_records(self) -> List[DNSRecord]:
-        try:
+        def _do_request() -> Any:
             response = self._session.get(f"{self._url}/control/rewrite/list", timeout=5)
             response.raise_for_status()
-            data = response.json()
+            return response.json()
+
+        try:
+            data = retry_with_backoff(_do_request, max_retries=2, base_delay=1.0)
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
             logger.error(f"Failed to get records from {self.name}: {e}")
             return []
@@ -344,10 +399,14 @@ class AdGuardDNSProvider(DNSProvider):
         return records
 
     def add_record(self, domain: str, answer: str) -> bool:
-        try:
+        def _do_request() -> bool:
             data = {"domain": domain, "answer": answer}
             response = self._session.post(f"{self._url}/control/rewrite/add", json=data, timeout=5)
             response.raise_for_status()
+            return True
+
+        try:
+            retry_with_backoff(_do_request, max_retries=2, base_delay=1.0)
             logger.info(f"Added DNS record: {domain} -> {answer}")
             return True
         except requests.exceptions.RequestException as e:
@@ -355,12 +414,16 @@ class AdGuardDNSProvider(DNSProvider):
             return False
 
     def delete_record(self, domain: str, answer: str) -> bool:
-        try:
+        def _do_request() -> bool:
             data = {"domain": domain, "answer": answer}
             response = self._session.post(
                 f"{self._url}/control/rewrite/delete", json=data, timeout=5
             )
             response.raise_for_status()
+            return True
+
+        try:
+            retry_with_backoff(_do_request, max_retries=2, base_delay=1.0)
             logger.info(f"Deleted DNS record: {domain} -> {answer}")
             return True
         except requests.exceptions.RequestException as e:
@@ -528,14 +591,18 @@ class TraefikProxyProvider(ReverseProxyProvider):
             session.auth = HTTPBasicAuth(instance.username, instance.password)
 
         base = instance.url.rstrip("/")
-        try:
+
+        def _do_request() -> Any:
             response = session.get(
                 f"{base}/api/http/routers",
                 timeout=self._timeout,
                 verify=instance.verify_tls,
             )
             response.raise_for_status()
-            routers = response.json()
+            return response.json()
+
+        try:
+            routers = retry_with_backoff(_do_request, max_retries=2, base_delay=1.0)
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
             logger.error(f"Failed to get routes from {instance.name}: {e}")
             raise

@@ -1,6 +1,7 @@
 """Unit tests for utility functions in external_dns.cli.
 
 Tests cover:
+- Retry with exponential backoff (retry_with_backoff)
 - Static rewrite parsing (_parse_static_rewrites)
 - Exclude pattern parsing (_parse_exclude_patterns)
 - Domain exclusion checking (_is_domain_excluded)
@@ -12,6 +13,9 @@ import os
 import re
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
+
+import requests
 
 from external_dns.cli import (
     _is_domain_excluded,
@@ -19,7 +23,141 @@ from external_dns.cli import (
     _parse_exclude_patterns,
     _parse_static_rewrites,
     find_config_files,
+    retry_with_backoff,
 )
+
+# =============================================================================
+# Retry with Backoff Tests
+# =============================================================================
+
+
+def test_retry_with_backoff_succeeds_first_try() -> None:
+    """Returns result immediately when no error occurs."""
+    call_count = 0
+
+    def success_func():
+        nonlocal call_count
+        call_count += 1
+        return "success"
+
+    result = retry_with_backoff(success_func, max_retries=3)
+
+    assert result == "success"
+    assert call_count == 1
+
+
+def test_retry_with_backoff_succeeds_after_retry() -> None:
+    """Retries and succeeds on later attempt."""
+    call_count = 0
+
+    def flaky_func():
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise requests.exceptions.ConnectionError("Connection refused")
+        return "success"
+
+    with patch("external_dns.cli.time.sleep"):  # Skip actual sleep
+        result = retry_with_backoff(flaky_func, max_retries=3, base_delay=0.1)
+
+    assert result == "success"
+    assert call_count == 3
+
+
+def test_retry_with_backoff_exhausts_retries() -> None:
+    """Raises last exception after max retries exhausted."""
+    call_count = 0
+
+    def always_fail():
+        nonlocal call_count
+        call_count += 1
+        raise requests.exceptions.ConnectionError(f"Attempt {call_count}")
+
+    import pytest
+
+    with patch("external_dns.cli.time.sleep"):  # Skip actual sleep
+        with pytest.raises(requests.exceptions.ConnectionError) as exc_info:
+            retry_with_backoff(always_fail, max_retries=2, base_delay=0.1)
+
+    assert call_count == 3  # Initial + 2 retries
+    assert "Attempt 3" in str(exc_info.value)
+
+
+def test_retry_with_backoff_respects_max_delay() -> None:
+    """Delay is capped at max_delay."""
+    call_count = 0
+    sleep_calls: list[float] = []
+
+    def always_fail():
+        nonlocal call_count
+        call_count += 1
+        raise requests.exceptions.ConnectionError("Connection refused")
+
+    def track_sleep(delay: float):
+        sleep_calls.append(delay)
+
+    import pytest
+
+    with patch("external_dns.cli.time.sleep", side_effect=track_sleep):
+        with pytest.raises(requests.exceptions.ConnectionError):
+            retry_with_backoff(
+                always_fail,
+                max_retries=5,
+                base_delay=1.0,
+                max_delay=3.0,
+                exponential_base=2.0,
+            )
+
+    # With base=1.0 and exponential_base=2.0:
+    # Attempt 0 fails -> delay = min(1.0 * 2^0, 3.0) = 1.0
+    # Attempt 1 fails -> delay = min(1.0 * 2^1, 3.0) = 2.0
+    # Attempt 2 fails -> delay = min(1.0 * 2^2, 3.0) = 3.0 (capped)
+    # Attempt 3 fails -> delay = min(1.0 * 2^3, 3.0) = 3.0 (capped)
+    # Attempt 4 fails -> delay = min(1.0 * 2^4, 3.0) = 3.0 (capped)
+    # Attempt 5 fails -> no more retries
+    assert sleep_calls == [1.0, 2.0, 3.0, 3.0, 3.0]
+
+
+def test_retry_with_backoff_only_retries_specified_exceptions() -> None:
+    """Non-retryable exceptions propagate immediately."""
+    call_count = 0
+
+    def raise_value_error():
+        nonlocal call_count
+        call_count += 1
+        raise ValueError("Not retryable")
+
+    import pytest
+
+    # ValueError is not in retryable_exceptions (default is RequestException)
+    with pytest.raises(ValueError):
+        retry_with_backoff(raise_value_error, max_retries=3)
+
+    # Should not have retried - only called once
+    assert call_count == 1
+
+
+def test_retry_with_backoff_custom_retryable_exceptions() -> None:
+    """Custom retryable exceptions are respected."""
+    call_count = 0
+
+    def raise_custom_error():
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            raise ValueError("Custom retryable")
+        return "success"
+
+    with patch("external_dns.cli.time.sleep"):
+        result = retry_with_backoff(
+            raise_custom_error,
+            max_retries=2,
+            retryable_exceptions=(ValueError,),
+        )
+
+    assert result == "success"
+    assert call_count == 2
+
 
 # =============================================================================
 # Static Rewrite Parsing Tests
