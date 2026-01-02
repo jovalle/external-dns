@@ -1,0 +1,65 @@
+networks:
+  backend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${NETWORK_SUBNET:-172.52.0.0/16}
+
+services:
+  adguard:
+    container_name: ${ADGUARD_CONTAINER_NAME:-adguard}
+    image: ${ADGUARD_IMAGE:-adguard/adguardhome:latest}
+    networks:
+      backend:
+        ipv4_address: ${ADGUARD_IP:-172.52.0.10}
+    ports:
+      - "${ADGUARD_WEB_PORT:-3000}:3000" # Web UI + control API
+      - "${DNS_PORT:-53}:53/tcp" # DNS
+      - "${DNS_PORT:-53}:53/udp" # DNS
+    restart: unless-stopped
+    volumes:
+      - ${ADGUARD_CONF_PATH:-./docker/local/adguard/conf}:/opt/adguardhome/conf
+      - ${ADGUARD_WORK_PATH:-./docker/local/adguard/work}:/opt/adguardhome/work
+
+  external-dns:
+    cap_drop:
+      - ALL
+    container_name: ${EXTERNAL_DNS_CONTAINER_NAME:-external-dns}
+    image: ${EXTERNAL_DNS_IMAGE:-external-dns:local}
+    networks:
+      backend: {}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${EXTERNAL_DNS_CONFIG_PATH:-./docker/local/external-dns/config}:/config:ro
+      - ${EXTERNAL_DNS_DATA_PATH:-./docker/local/external-dns/data}:/data
+
+  traefik:
+    command:
+      - --api.insecure=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+    container_name: ${TRAEFIK_CONTAINER_NAME:-traefik}
+    image: ${TRAEFIK_IMAGE:-traefik:v3.6.4}
+    networks:
+      backend:
+        ipv4_address: ${TRAEFIK_IP:-172.52.0.11}
+    ports:
+      - "${TRAEFIK_HTTP_PORT:-80}:80" # HTTP
+      - "${TRAEFIK_API_PORT:-8080}:8080" # Traefik API/dashboard
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  whoami:
+    container_name: ${WHOAMI_CONTAINER_NAME:-whoami}
+    image: ${WHOAMI_IMAGE:-traefik/whoami:latest}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.whoami-internal.rule=Host(`${WHOAMI_HOST:-whoami-internal.localtest.me}`)
+      - traefik.http.routers.whoami-internal.entrypoints=web
+    networks:
+      backend: {}
+    restart: unless-stopped

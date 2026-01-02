@@ -1,0 +1,36 @@
+---
+# Minimal AdGuard Home config for local testing.
+# NOTE: the container will expand/migrate this config at runtime.
+
+bind_host: 0.0.0.0
+bind_port: 3000
+
+http:
+  address: 0.0.0.0:3000
+  session_ttl: 720h
+
+users:
+  - name: admin
+    # bcrypt hash for the generic local password: "password"
+    password: $2y$05$IVCTvCcNtgKKYWPpejXDbO4m9.td6uADdOwNBw1XdQeNtaaS.7vEC
+
+dns:
+  bind_hosts:
+    - 0.0.0.0
+  port: 53
+  protection_enabled: true
+  filtering_enabled: false
+  blocking_mode: default
+  upstream_dns:
+    - 1.1.1.1
+  bootstrap_dns:
+    - 1.1.1.1
+  ratelimit: 0
+  querylog_enabled: true
+  statistics_enabled: true
+
+log:
+  enabled: true
+  file: ""
+
+schema_version: 14

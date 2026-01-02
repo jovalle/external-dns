@@ -190,7 +190,7 @@ def test_sync_removes_record_when_route_removed(tmp_path: Path) -> None:
         proxy_routes=routes,
     )
 
-    # First sync to establish state with the domain
+    # First sync to establish state with the domain (including managed_records)
     state_store = StateStore(str(tmp_path / "state.json"))
     state_store.save(
         {
@@ -199,6 +199,7 @@ def test_sync_removes_record_when_route_removed(tmp_path: Path) -> None:
             "domains": {
                 "app.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 0}}}
             },
+            "managed_records": {"app.example.com": ["10.0.0.1"]},
         }
     )
 
@@ -210,7 +211,7 @@ def test_sync_removes_record_when_route_removed(tmp_path: Path) -> None:
 
 
 def test_sync_updates_record_when_target_ip_changes(tmp_path: Path) -> None:
-    """Same domain with new IP should result in record update."""
+    """Same domain with new IP should result in record update (if managed)."""
     initial_records = [DNSRecord("app.example.com", "10.0.0.1")]
     instances = [make_instance("core", target_ip="10.0.0.2")]
     routes = {"core": [make_route("app.example.com", "10.0.0.2")]}
@@ -220,6 +221,17 @@ def test_sync_updates_record_when_target_ip_changes(tmp_path: Path) -> None:
         dns_records=initial_records,
         proxy_instances=instances,
         proxy_routes=routes,
+    )
+
+    # Pre-populate state to indicate record is managed
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {},
+            "domains": {},
+            "managed_records": {"app.example.com": ["10.0.0.1"]},
+        }
     )
 
     syncer.sync_once()
@@ -290,13 +302,13 @@ def test_sync_preserves_record_when_one_instance_fails(tmp_path: Path) -> None:
 
 
 def test_sync_removes_orphaned_records_when_instance_removed(tmp_path: Path) -> None:
-    """Instance removed from config should clean up its DNS records."""
+    """Instance removed from config should clean up its managed DNS records."""
     initial_records = [DNSRecord("app.example.com", "10.0.0.1")]
     # Only one instance now, but state has record from old instance
     instances = [make_instance("edge", "10.0.0.2")]
     routes: Dict[str, List[ProxyRoute]] = {"edge": []}
 
-    # Pre-populate state with domain owned by removed instance "core"
+    # Pre-populate state with domain owned by removed instance "core" (including managed_records)
     state_store = StateStore(str(tmp_path / "state.json"))
     state_store.save(
         {
@@ -307,6 +319,7 @@ def test_sync_removes_orphaned_records_when_instance_removed(tmp_path: Path) -> 
             "domains": {
                 "app.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 1000}}},
             },
+            "managed_records": {"app.example.com": ["10.0.0.1"]},
         }
     )
 
@@ -404,7 +417,7 @@ def test_sync_excludes_domains_matching_regex_pattern(tmp_path: Path) -> None:
 
 
 def test_sync_removes_existing_excluded_domain_records(tmp_path: Path) -> None:
-    """Newly excluded domain should have its existing DNS record deleted."""
+    """Newly excluded domain should have its managed DNS record deleted."""
     initial_records = [DNSRecord("auth.example.com", "10.0.0.1")]
     instances = [make_instance("core")]
     routes: Dict[str, List[ProxyRoute]] = {"core": []}
@@ -418,9 +431,20 @@ def test_sync_removes_existing_excluded_domain_records(tmp_path: Path) -> None:
         exclude_patterns=patterns,
     )
 
+    # Pre-populate state to indicate record is managed
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {},
+            "domains": {},
+            "managed_records": {"auth.example.com": ["10.0.0.1"]},
+        }
+    )
+
     syncer.sync_once()
 
-    # Excluded domain should be removed from DNS
+    # Excluded domain should be removed from DNS (only if managed)
     assert ("auth.example.com", "10.0.0.1") in dns.delete_calls
 
 
@@ -493,7 +517,7 @@ def test_sync_adds_missing_static_rewrite(tmp_path: Path) -> None:
 
 
 def test_sync_updates_static_rewrite_with_wrong_ip(tmp_path: Path) -> None:
-    """Static rewrite with different IP should be updated."""
+    """Static rewrite with different IP should be updated (if managed)."""
     initial_records = [DNSRecord("static.example.com", "10.0.0.1")]
     instances = [make_instance("core")]
     routes: Dict[str, List[ProxyRoute]] = {"core": []}
@@ -505,6 +529,17 @@ def test_sync_updates_static_rewrite_with_wrong_ip(tmp_path: Path) -> None:
         proxy_instances=instances,
         proxy_routes=routes,
         static_rewrites=static_rewrites,
+    )
+
+    # Pre-populate state to indicate record is managed
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {},
+            "domains": {},
+            "managed_records": {"static.example.com": ["10.0.0.1"]},
+        }
     )
 
     syncer.sync_once()
@@ -573,7 +608,7 @@ def test_sync_handles_empty_routes(tmp_path: Path) -> None:
 
 
 def test_sync_handles_duplicate_dns_records(tmp_path: Path) -> None:
-    """Multiple DNS records for same domain should be consolidated to one."""
+    """Multiple managed DNS records for same domain should be consolidated to one."""
     # Create provider with duplicates by directly manipulating internal state
     dns_provider = MockDNSProvider()
     dns_provider._records["app.example.com"] = "10.0.0.1"
@@ -592,6 +627,16 @@ def test_sync_handles_duplicate_dns_records(tmp_path: Path) -> None:
     proxy_provider = MockProxyProvider(instances=instances, routes_by_instance=routes)
     state_store = StateStore(str(tmp_path / "state.json"))
 
+    # Pre-populate state to indicate records are managed
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {},
+            "domains": {},
+            "managed_records": {"app.example.com": ["10.0.0.1", "10.0.0.2"]},
+        }
+    )
+
     syncer = ExternalDNSSyncer(
         dns_provider=dns_provider,
         proxy_provider=proxy_provider,
@@ -602,7 +647,7 @@ def test_sync_handles_duplicate_dns_records(tmp_path: Path) -> None:
 
     syncer.sync_once()
 
-    # Both duplicates should be deleted and correct record added
+    # Both managed duplicates should be deleted and correct record added
     assert ("app.example.com", "10.0.0.1") in dns_provider.delete_calls
     assert ("app.example.com", "10.0.0.2") in dns_provider.delete_calls
     assert ("app.example.com", "10.0.0.3") in dns_provider.add_calls
@@ -829,3 +874,186 @@ def test_sync_state_not_corrupted_on_partial_failure(tmp_path: Path) -> None:
 
     # app1 domain from core should be in state
     assert "app1.example.com" in state["domains"]
+
+
+# =============================================================================
+# Pre-existing Record Protection Tests
+# =============================================================================
+
+
+def test_sync_preserves_preexisting_records_on_domain_removal(tmp_path: Path) -> None:
+    """Pre-existing (unmanaged) records should NOT be deleted when domain is removed from proxy."""
+    # DNS has a pre-existing record that external-dns didn't create
+    initial_records = [DNSRecord("app.example.com", "10.0.0.1")]
+    instances = [make_instance("core")]
+    routes: Dict[str, List[ProxyRoute]] = {"core": []}  # No routes
+
+    # State has the domain tracked but NOT in managed_records (pre-existing)
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {"core": {"last_success": 0, "last_error": "", "url": "http://core:8080"}},
+            "domains": {
+                "app.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 0}}}
+            },
+            # Note: NO managed_records entry - this record was pre-existing
+        }
+    )
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        dns_records=initial_records,
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+
+    syncer.sync_once()
+
+    # Pre-existing record should NOT be deleted
+    assert ("app.example.com", "10.0.0.1") not in dns.delete_calls
+    records = {r.domain: r.answer for r in dns.get_records()}
+    assert records.get("app.example.com") == "10.0.0.1"
+
+
+def test_sync_preserves_preexisting_records_when_proxy_wants_different_ip(tmp_path: Path) -> None:
+    """Pre-existing records should NOT be overwritten when proxy advertises different IP."""
+    # DNS has a pre-existing record
+    initial_records = [DNSRecord("app.example.com", "192.168.1.100")]
+    instances = [make_instance("core", target_ip="10.0.0.1")]
+    routes = {"core": [make_route("app.example.com", "10.0.0.1")]}
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        dns_records=initial_records,
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+
+    syncer.sync_once()
+
+    # Pre-existing record should NOT be deleted or modified
+    assert ("app.example.com", "192.168.1.100") not in dns.delete_calls
+    # New record should NOT be added (conflict with pre-existing)
+    assert ("app.example.com", "10.0.0.1") not in dns.add_calls
+    records = {r.domain: r.answer for r in dns.get_records()}
+    assert records.get("app.example.com") == "192.168.1.100"
+
+
+def test_sync_preserves_preexisting_excluded_records(tmp_path: Path) -> None:
+    """Pre-existing records matching exclusion patterns should NOT be deleted."""
+    initial_records = [DNSRecord("auth.example.com", "10.0.0.1")]
+    instances = [make_instance("core")]
+    routes: Dict[str, List[ProxyRoute]] = {"core": []}
+    patterns = [re.compile(r"^auth\.example\.com$")]
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        dns_records=initial_records,
+        proxy_instances=instances,
+        proxy_routes=routes,
+        exclude_patterns=patterns,
+    )
+
+    # No managed_records - record is pre-existing
+    syncer.sync_once()
+
+    # Pre-existing record should NOT be deleted
+    assert ("auth.example.com", "10.0.0.1") not in dns.delete_calls
+    records = {r.domain: r.answer for r in dns.get_records()}
+    assert records.get("auth.example.com") == "10.0.0.1"
+
+
+def test_sync_preserves_preexisting_static_rewrite_with_wrong_ip(tmp_path: Path) -> None:
+    """Pre-existing records should NOT be updated even for static rewrites."""
+    initial_records = [DNSRecord("static.example.com", "192.168.1.100")]
+    instances = [make_instance("core")]
+    routes: Dict[str, List[ProxyRoute]] = {"core": []}
+    static_rewrites = {"static.example.com": "10.0.0.99"}
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        dns_records=initial_records,
+        proxy_instances=instances,
+        proxy_routes=routes,
+        static_rewrites=static_rewrites,
+    )
+
+    # No managed_records - record is pre-existing
+    syncer.sync_once()
+
+    # Pre-existing record should NOT be updated
+    assert len(dns.update_calls) == 0
+    records = {r.domain: r.answer for r in dns.get_records()}
+    assert records.get("static.example.com") == "192.168.1.100"
+
+
+def test_sync_adopts_preexisting_record_with_matching_answer(tmp_path: Path) -> None:
+    """Pre-existing record with matching answer should be adopted as managed."""
+    initial_records = [DNSRecord("app.example.com", "10.0.0.1")]
+    instances = [make_instance("core", target_ip="10.0.0.1")]
+    routes = {"core": [make_route("app.example.com", "10.0.0.1")]}
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        dns_records=initial_records,
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+
+    syncer.sync_once()
+
+    # No changes to DNS
+    assert len(dns.add_calls) == 0
+    assert len(dns.delete_calls) == 0
+
+    # Record should now be tracked as managed
+    state = syncer.state_store.load()
+    assert "app.example.com" in state.get("managed_records", {})
+    assert "10.0.0.1" in state["managed_records"]["app.example.com"]
+
+    # On subsequent sync, if domain is removed, it SHOULD be deleted (now managed)
+    syncer2, dns2, _ = create_test_syncer(
+        tmp_path,
+        dns_records=[DNSRecord("app.example.com", "10.0.0.1")],
+        proxy_instances=[make_instance("core", target_ip="10.0.0.1")],
+        proxy_routes={"core": []},  # Domain removed
+    )
+
+    syncer2.sync_once()
+
+    # Now it should be deleted because it's managed
+    assert ("app.example.com", "10.0.0.1") in dns2.delete_calls
+
+
+def test_sync_managed_records_tracked_across_syncs(tmp_path: Path) -> None:
+    """Records created by external-dns should be tracked and deletable."""
+    instances = [make_instance("core")]
+    routes = {"core": [make_route("app.example.com", "10.0.0.1")]}
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+
+    # First sync - creates record
+    syncer.sync_once()
+    assert ("app.example.com", "10.0.0.1") in dns.add_calls
+
+    # Verify record is tracked as managed
+    state = syncer.state_store.load()
+    assert "app.example.com" in state.get("managed_records", {})
+
+    # Second sync with domain removed - should delete
+    syncer2, dns2, _ = create_test_syncer(
+        tmp_path,
+        dns_records=[DNSRecord("app.example.com", "10.0.0.1")],
+        proxy_instances=[make_instance("core")],
+        proxy_routes={"core": []},  # No routes
+    )
+
+    syncer2.sync_once()
+
+    # Should be deleted because it's managed
+    assert ("app.example.com", "10.0.0.1") in dns2.delete_calls

@@ -1,0 +1,35 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv
+.venv/
+venv/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Local docker test artifacts
+docker/local/**/data/
+docker/local/**/work/
+docker/**/state.json
+docker/local/adguard/conf/AdGuardHome.yaml
+docker/data/
+
+# Production config (may contain credentials)
+docker/config/config.yaml
+
+# Coverage
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.env

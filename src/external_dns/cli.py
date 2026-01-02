@@ -12,50 +12,53 @@ Supported Reverse Proxy Providers:
     - traefik: Traefik HTTP routers
     (more coming soon)
 
-Environment variables:
+Configuration:
 
-    Provider Selection:
-        DNS_PROVIDER           DNS provider type: "adguard" (default: adguard)
-        PROXY_PROVIDER         Reverse proxy type: "traefik" (default: traefik)
+    All configuration is done via a YAML config file. Environment variables are
+    supported as fallback for backwards compatibility.
 
-    AdGuard DNS Provider:
-        ADGUARD_URL            AdGuard Home base URL (default: http://adguard)
-        ADGUARD_USERNAME       Admin username (optional)
-        ADGUARD_PASSWORD       Admin password (optional)
+    Config file location:
+        CONFIG_PATH    Path to YAML config file (default: /config/config.yaml)
 
-    Traefik Reverse Proxy:
-        TRAEFIK_CONFIG_PATH    Path to YAML config file with Traefik instances
-                               (default: /config/traefik-instances.yaml)
-                               Example config file:
-                                 instances:
-                                   - name: "core"
-                                     url: "http://traefik:8080"
-                                     target_ip: "10.0.0.2"
-                                     verify_tls: true
-                                     router_filter: "*-internal"
-                                   - name: "edge"
-                                     url: "https://traefik2:8080"
-                                     target_ip: "10.0.0.3"
-                                     verify_tls: false
-                                     router_filter: ""
+    Example config file:
 
-        TRAEFIK_INSTANCES      JSON list of instances (legacy, use config file instead).
-                               Example:
-                               [{"name":"core","url":"http://traefik:8080","target_ip":"10.0.0.2"},
-                                {"name":"edge","url":"https://traefik2:8080","target_ip":"10.0.0.3","verify_tls":false}]
+        # DNS providers - where DNS records are written
+        providers:
+          - name: adguard-home
+            provider: adguard  # Provider type: adguard (default)
+            url: "http://adguard:3000"
+            username: "admin"
+            password: "secret"
 
-        Backwards-compatible single-instance mode (used if config file and TRAEFIK_INSTANCES unset):
-            TRAEFIK_URL          Traefik base URL (default: http://traefik:8080)
-            TRAEFIK_TARGET_IP    Target IP to use for rewrites (falls back to INTERNAL_IP)
-            INTERNAL_IP          Legacy name for the target IP
+        # Sources - reverse proxy instances to discover routes from
+        sources:
+          - name: "core"
+            url: "http://traefik:8080"
+            target_ip: "10.0.0.2"
+            verify_tls: true
+            router_filter: "*-internal"
+          - name: "edge"
+            url: "https://traefik2:8080"
+            target_ip: "10.0.0.3"
+            verify_tls: false
 
-    Router Filtering:
-        router_filter          Per-instance wildcard pattern to filter routers (in YAML config)
-                               Only routers matching this pattern will be synced to DNS
-                               Examples: "*-internal", "app-*", "*-public-*"
-                               Empty string = no filtering (sync all routers)
+    DNS Provider Configuration (providers section):
+        name            Friendly name for this provider instance
+        provider        Provider type: "adguard" (default)
+        url             Provider API URL (required)
+        username        API username (optional, for basic auth)
+        password        API password (optional, for basic auth)
 
-    Runtime:
+    Source Configuration (sources section):
+        name            Friendly name for this source
+        type            Source type: "traefik" (default)
+        url             API URL (required)
+        target_ip       IP address to use for DNS records (required)
+        verify_tls      Verify TLS certificates (default: true)
+        router_filter   Wildcard pattern to filter routers (e.g., "*-internal")
+        middleware_filter  Filter by middleware name
+
+    Runtime Environment Variables:
         SYNC_MODE              "once" or "watch" (polling loop) (default: watch)
         POLL_INTERVAL_SECONDS  Poll interval in watch mode (default: 60)
         LOG_LEVEL              DEBUG, INFO, WARNING, ERROR (default: INFO)
@@ -71,7 +74,7 @@ Environment variables:
                                   Supports three formats:
                                     - Exact domain: "auth.example.com"
                                     - Wildcard (fnmatch-style): "*.internal.*", "dev-*"
-                                    - Regex (prefix with ~): "~^staging-\d+\.example\.com$"
+                                    - Regex (prefix with ~): "~^staging-\\d+\\.example\\.com$"
                                   Excluded domains are NOT synced to DNS. Existing
                                   records matching exclusions are cleaned up automatically.
 
@@ -101,7 +104,9 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -204,6 +209,221 @@ def get_config_files_mtimes(config_files: List[str]) -> Dict[str, float]:
     return {f: get_config_file_mtime(f) for f in config_files}
 
 
+@dataclass
+class DNSProviderConfig:
+    """Configuration for a DNS provider."""
+
+    name: str
+    provider: str  # adguard, cloudflare, etc.
+    url: str
+    username: str = ""
+    password: str = ""
+    api_token: str = ""  # For providers that use API tokens
+
+
+def load_dns_providers_from_yaml(config_path: str) -> List[DNSProviderConfig]:
+    """Load DNS provider configurations from YAML config file.
+
+    Supports two formats:
+    - New format: 'providers' list with 'provider' field for type
+    - Legacy format: 'dns_provider' single dict (backwards compatible)
+
+    Args:
+        config_path: Path to config file or directory
+
+    Returns:
+        List of DNSProviderConfig objects
+    """
+    config_files = find_config_files(config_path)
+    if not config_files:
+        return []
+
+    providers: List[DNSProviderConfig] = []
+
+    for config_file in config_files:
+        try:
+            with open(config_file, "r") as f:
+                config_data = yaml.safe_load(f)
+
+            if not config_data:
+                continue
+
+            # New format: 'providers' list
+            if "providers" in config_data:
+                providers_list = config_data["providers"]
+                if isinstance(providers_list, list):
+                    for item in providers_list:
+                        if not isinstance(item, dict):
+                            continue
+                        provider_type = str(item.get("provider") or "adguard").strip().lower()
+                        name = str(item.get("name") or provider_type).strip()
+                        url = str(item.get("url") or "").strip()
+                        if not url:
+                            continue
+                        providers.append(
+                            DNSProviderConfig(
+                                name=name,
+                                provider=provider_type,
+                                url=url,
+                                username=str(item.get("username") or "").strip(),
+                                password=str(item.get("password") or "").strip(),
+                                api_token=str(item.get("api_token") or "").strip(),
+                            )
+                        )
+
+            # Legacy format: 'dns_provider' single dict
+            elif "dns_provider" in config_data:
+                dns_config = config_data["dns_provider"]
+                if isinstance(dns_config, dict):
+                    url = str(dns_config.get("url") or "").strip()
+                    if url:
+                        providers.append(
+                            DNSProviderConfig(
+                                name="default",
+                                provider="adguard",
+                                url=url,
+                                username=str(dns_config.get("username") or "").strip(),
+                                password=str(dns_config.get("password") or "").strip(),
+                            )
+                        )
+
+        except Exception as e:
+            logger.debug(f"Failed to parse DNS config from {config_file}: {e}")
+            continue
+
+    return providers
+
+
+def load_dns_config_from_yaml(config_path: str) -> Optional[Dict[str, str]]:
+    """Load DNS provider configuration from YAML config file.
+
+    Looks for 'providers' (new) or 'dns_provider' (legacy) section.
+
+    Args:
+        config_path: Path to config file or directory
+
+    Returns:
+        Dict with url, username, password if found, None otherwise
+    """
+    providers = load_dns_providers_from_yaml(config_path)
+    if not providers:
+        return None
+
+    # Return first provider for backwards compatibility
+    p = providers[0]
+    return {
+        "url": p.url,
+        "username": p.username,
+        "password": p.password,
+    }
+
+
+@dataclass
+class RuntimeSettings:
+    """Runtime configuration settings."""
+
+    sync_mode: str = "watch"
+    poll_interval: int = 60
+    log_level: str = "INFO"
+    default_zone: str = "internal"
+    exclude_domains: List[str] = None  # type: ignore
+    static_rewrites: Dict[str, str] = None  # type: ignore
+
+    def __post_init__(self):
+        if self.exclude_domains is None:
+            self.exclude_domains = []
+        if self.static_rewrites is None:
+            self.static_rewrites = {}
+
+
+def load_settings_from_yaml(config_path: str) -> RuntimeSettings:
+    """Load runtime settings from YAML config file.
+
+    Env vars take priority over YAML config values.
+
+    Args:
+        config_path: Path to config file or directory
+
+    Returns:
+        RuntimeSettings with merged values (env vars override YAML)
+    """
+    settings = RuntimeSettings()
+    config_files = find_config_files(config_path)
+
+    # Load from YAML first
+    for config_file in config_files:
+        try:
+            with open(config_file, "r") as f:
+                config_data = yaml.safe_load(f)
+
+            if not config_data:
+                continue
+
+            # Load settings section
+            if "settings" in config_data and isinstance(config_data["settings"], dict):
+                s = config_data["settings"]
+                if "sync_mode" in s:
+                    settings.sync_mode = str(s["sync_mode"]).strip().lower()
+                if "poll_interval" in s:
+                    settings.poll_interval = int(s["poll_interval"])
+                if "log_level" in s:
+                    settings.log_level = str(s["log_level"]).strip().upper()
+                if "default_zone" in s:
+                    settings.default_zone = str(s["default_zone"]).strip().lower()
+
+            # Load exclude_domains list
+            if "exclude_domains" in config_data:
+                excludes = config_data["exclude_domains"]
+                if isinstance(excludes, list):
+                    settings.exclude_domains = [str(e).strip() for e in excludes if e]
+
+            # Load static_rewrites dict
+            if "static_rewrites" in config_data:
+                rewrites = config_data["static_rewrites"]
+                if isinstance(rewrites, dict):
+                    settings.static_rewrites = {
+                        str(k).strip(): str(v).strip() for k, v in rewrites.items() if k
+                    }
+
+        except Exception:
+            # Log at debug since logger may not be configured yet
+            pass  # Will use defaults
+
+    # Env vars override YAML values
+    if os.getenv("SYNC_MODE"):
+        settings.sync_mode = os.getenv("SYNC_MODE", "watch").strip().lower()
+    if os.getenv("POLL_INTERVAL_SECONDS"):
+        settings.poll_interval = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+    if os.getenv("LOG_LEVEL"):
+        settings.log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    if os.getenv("EXTERNAL_DNS_DEFAULT_ZONE"):
+        settings.default_zone = os.getenv("EXTERNAL_DNS_DEFAULT_ZONE", "internal").strip().lower()
+
+    # Merge exclude domains from env var (append to YAML list)
+    env_excludes = os.getenv("EXTERNAL_DNS_EXCLUDE_DOMAINS", "").strip()
+    if env_excludes:
+        for item in env_excludes.split(","):
+            item = item.strip()
+            if item and item not in settings.exclude_domains:
+                settings.exclude_domains.append(item)
+
+    # Merge static rewrites from env var (override YAML values)
+    env_rewrites = os.getenv("EXTERNAL_DNS_STATIC_REWRITES", "").strip()
+    if env_rewrites:
+        for item in env_rewrites.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" in item:
+                domain, answer = item.split("=", 1)
+                settings.static_rewrites[domain.strip()] = answer.strip()
+            else:
+                # Will use first instance target_ip as default (handled later)
+                settings.static_rewrites[item] = ""
+
+    return settings
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -212,13 +432,13 @@ def get_config_files_mtimes(config_files: List[str]) -> Dict[str, float]:
 DNS_PROVIDER = os.getenv("DNS_PROVIDER", "adguard").lower().strip()
 PROXY_PROVIDER = os.getenv("PROXY_PROVIDER", "traefik").lower().strip()
 
-# AdGuard configuration
-ADGUARD_URL = os.getenv("ADGUARD_URL", "http://adguard")
+# AdGuard configuration (env vars as fallback, YAML config takes priority)
+ADGUARD_URL = os.getenv("ADGUARD_URL", "")
 ADGUARD_USERNAME = os.getenv("ADGUARD_USERNAME", "")
 ADGUARD_PASSWORD = os.getenv("ADGUARD_PASSWORD", "")
 
-# Traefik configuration
-TRAEFIK_CONFIG_PATH = os.getenv("TRAEFIK_CONFIG_PATH", "/config/traefik-instances.yaml")
+# Config file path (supports CONFIG_PATH for backwards compatibility)
+CONFIG_PATH = os.getenv("CONFIG_PATH", os.getenv("CONFIG_PATH", "/config/config.yaml"))
 TRAEFIK_INSTANCES = os.getenv("TRAEFIK_INSTANCES", "").strip()
 TRAEFIK_URL = os.getenv("TRAEFIK_URL", "http://traefik:8080")
 TRAEFIK_TARGET_IP = os.getenv("TRAEFIK_TARGET_IP", os.getenv("INTERNAL_IP", ""))
@@ -247,6 +467,17 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# Shutdown event for graceful termination
+_shutdown_event = threading.Event()
+
+
+def _signal_handler(signum: int, frame: Any) -> None:
+    """Handle shutdown signals (SIGTERM, SIGINT) for graceful termination."""
+    sig_name = signal.Signals(signum).name
+    logger.info(f"Received {sig_name}, initiating graceful shutdown...")
+    _shutdown_event.set()
+
 
 # =============================================================================
 # Enums
@@ -508,11 +739,11 @@ class TraefikProxyProvider(ReverseProxyProvider):
                         with open(config_file, "r") as f:
                             config_data = yaml.safe_load(f)
 
-                        if not config_data or "instances" not in config_data:
-                            logger.warning(f"Config file {config_file} missing 'instances' key")
+                        if not config_data or "sources" not in config_data:
+                            logger.warning(f"Config file {config_file} missing 'sources' key")
                             continue
 
-                        for item in config_data["instances"]:
+                        for item in config_data["sources"]:
                             if not isinstance(item, dict):
                                 continue
                             name = str(item.get("name") or "traefik").strip()
@@ -739,11 +970,33 @@ class TraefikProxyProvider(ReverseProxyProvider):
 # =============================================================================
 
 
+def get_dns_config() -> Dict[str, str]:
+    """Get DNS provider configuration from YAML config or env vars.
+
+    Priority: YAML config > environment variables
+
+    Returns:
+        Dict with url, username, password
+    """
+    # Try YAML config first
+    yaml_config = load_dns_config_from_yaml(CONFIG_PATH)
+    if yaml_config:
+        return yaml_config
+
+    # Fall back to environment variables
+    return {
+        "url": ADGUARD_URL,
+        "username": ADGUARD_USERNAME,
+        "password": ADGUARD_PASSWORD,
+    }
+
+
 def create_dns_provider() -> DNSProvider:
     """Factory function to create the configured DNS provider."""
     supported = ["adguard"]
     if DNS_PROVIDER == "adguard":
-        return AdGuardDNSProvider(ADGUARD_URL, ADGUARD_USERNAME, ADGUARD_PASSWORD)
+        config = get_dns_config()
+        return AdGuardDNSProvider(config["url"], config["username"], config["password"])
     else:
         raise ValueError(
             f"Unsupported DNS_PROVIDER: '{DNS_PROVIDER}'. "
@@ -752,16 +1005,21 @@ def create_dns_provider() -> DNSProvider:
         )
 
 
-def create_proxy_provider() -> ReverseProxyProvider:
-    """Factory function to create the configured reverse proxy provider."""
+def create_proxy_provider(default_zone: Optional[str] = None) -> ReverseProxyProvider:
+    """Factory function to create the configured reverse proxy provider.
+
+    Args:
+        default_zone: Override default zone (from settings or env var)
+    """
     supported = ["traefik"]
+    zone = default_zone or EXTERNAL_DNS_DEFAULT_ZONE
     if PROXY_PROVIDER == "traefik":
         return TraefikProxyProvider(
-            config_path=TRAEFIK_CONFIG_PATH,
+            config_path=CONFIG_PATH,
             instances_json=TRAEFIK_INSTANCES,
             url=TRAEFIK_URL,
             target_ip=TRAEFIK_TARGET_IP,
-            default_zone=EXTERNAL_DNS_DEFAULT_ZONE,
+            default_zone=zone,
             zone_label=EXTERNAL_DNS_ZONE_LABEL,
         )
     else:
@@ -785,14 +1043,21 @@ def _parse_bool(value: Any, *, default: bool = True) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _parse_exclude_patterns(value: str) -> List[re.Pattern]:
-    """Parse domain exclusion patterns from env var."""
+def _parse_exclude_patterns(value: Any) -> List[re.Pattern]:
+    """Parse domain exclusion patterns from list or comma-separated string."""
     patterns: List[re.Pattern] = []
     if not value:
         return patterns
 
-    for raw_item in value.split(","):
-        item = raw_item.strip()
+    # Convert to list if string
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",")]
+    elif isinstance(value, list):
+        items = [str(item).strip() for item in value]
+    else:
+        return patterns
+
+    for item in items:
         if not item:
             continue
 
@@ -899,7 +1164,28 @@ class ExternalDNSSyncer:
         self.exclude_patterns = exclude_patterns
         self._startup_cleanup_done = False
 
-    def _sync_static_rewrites(self) -> None:
+    def _is_record_managed(self, state: Dict[str, Any], domain: str, answer: str) -> bool:
+        """Check if a DNS record was created by external-dns."""
+        managed = state.get("managed_records", {})
+        return answer in managed.get(domain, [])
+
+    def _mark_record_managed(self, state: Dict[str, Any], domain: str, answer: str) -> None:
+        """Track a DNS record as managed by external-dns."""
+        managed = state.setdefault("managed_records", {})
+        domain_answers = managed.setdefault(domain, [])
+        if answer not in domain_answers:
+            domain_answers.append(answer)
+
+    def _unmark_record_managed(self, state: Dict[str, Any], domain: str, answer: str) -> None:
+        """Remove a DNS record from managed tracking."""
+        managed = state.get("managed_records", {})
+        if domain in managed:
+            if answer in managed[domain]:
+                managed[domain].remove(answer)
+            if not managed[domain]:
+                del managed[domain]
+
+    def _sync_static_rewrites(self, state: Dict[str, Any]) -> None:
         if not self.static_rewrites:
             return
 
@@ -907,14 +1193,26 @@ class ExternalDNSSyncer:
 
         for domain, answer in self.static_rewrites.items():
             if domain in current_records:
-                if current_records[domain] != answer:
-                    logger.info(
-                        f"Updating static rewrite {domain}: {current_records[domain]} -> {answer}"
+                current_answer = current_records[domain]
+                if current_answer == answer:
+                    # Record already exists with correct answer - mark as managed
+                    self._mark_record_managed(state, domain, answer)
+                elif self._is_record_managed(state, domain, current_answer):
+                    # Record is managed by us with wrong answer - update it
+                    logger.info(f"Updating static rewrite {domain}: {current_answer} -> {answer}")
+                    self.dns_provider.update_record(domain, current_answer, answer)
+                    self._unmark_record_managed(state, domain, current_answer)
+                    self._mark_record_managed(state, domain, answer)
+                else:
+                    # Pre-existing record not managed by us - warn and skip
+                    logger.warning(
+                        f"Static rewrite {domain} -> {answer} conflicts with pre-existing "
+                        f"record {domain} -> {current_answer} (not managed by external-dns, skipping)"
                     )
-                    self.dns_provider.update_record(domain, current_records[domain], answer)
             else:
                 logger.info(f"Adding static rewrite {domain} -> {answer}")
                 self.dns_provider.add_record(domain, answer)
+                self._mark_record_managed(state, domain, answer)
 
     def _cleanup_removed_instances(
         self, state: Dict[str, Any], instances: List[ProxyInstance]
@@ -952,7 +1250,7 @@ class ExternalDNSSyncer:
             if not sources:
                 domains_to_cleanup.append(domain)
 
-        # Delete DNS records for domains with no remaining sources
+        # Delete DNS records for domains with no remaining sources (only if managed)
         for domain in sorted(domains_to_cleanup):
             # Don't remove static rewrites
             if domain in self.static_rewrites:
@@ -960,8 +1258,16 @@ class ExternalDNSSyncer:
                 continue
 
             for answer in records_by_domain.get(domain, []):
-                logger.info(f"Removing orphaned record from removed instance: {domain} -> {answer}")
-                self.dns_provider.delete_record(domain, answer)
+                if self._is_record_managed(state, domain, answer):
+                    logger.info(
+                        f"Removing orphaned record from removed instance: {domain} -> {answer}"
+                    )
+                    self.dns_provider.delete_record(domain, answer)
+                    self._unmark_record_managed(state, domain, answer)
+                else:
+                    logger.debug(
+                        f"Skipping pre-existing record during instance cleanup: {domain} -> {answer}"
+                    )
 
             # Remove from state
             state["domains"].pop(domain, None)
@@ -977,6 +1283,7 @@ class ExternalDNSSyncer:
         state.setdefault("version", 1)
         state.setdefault("instances", {})
         state.setdefault("domains", {})
+        state.setdefault("managed_records", {})
 
         instances = self.proxy_provider.get_instances()
 
@@ -986,7 +1293,7 @@ class ExternalDNSSyncer:
             self._startup_cleanup_done = True
 
         # Ensure static rewrites first.
-        self._sync_static_rewrites()
+        self._sync_static_rewrites(state)
 
         instance_success: Dict[str, bool] = {}
         instance_seen_domains: Dict[str, Set[str]] = {}
@@ -1113,43 +1420,90 @@ class ExternalDNSSyncer:
         for r in all_records:
             records_by_domain.setdefault(r.domain, []).append(r.answer)
 
-        # Clean up existing DNS records that match exclusion patterns
+        # Clean up existing DNS records that match exclusion patterns (only managed records)
         if self.exclude_patterns:
             for domain, answers in list(records_by_domain.items()):
                 # Skip static rewrites
                 if domain in self.static_rewrites:
                     continue
                 if _is_domain_excluded(domain, self.exclude_patterns):
+                    deleted_any = False
                     for answer in answers:
-                        logger.info(f"Removing excluded domain from DNS: {domain} -> {answer}")
-                        self.dns_provider.delete_record(domain, answer)
+                        if self._is_record_managed(state, domain, answer):
+                            logger.info(f"Removing excluded domain from DNS: {domain} -> {answer}")
+                            self.dns_provider.delete_record(domain, answer)
+                            self._unmark_record_managed(state, domain, answer)
+                            deleted_any = True
+                        else:
+                            logger.debug(
+                                f"Skipping pre-existing excluded record: {domain} -> {answer}"
+                            )
                     # Also remove from state if present
                     state["domains"].pop(domain, None)
                     # Remove from records_by_domain so we don't process it later
-                    del records_by_domain[domain]
+                    if deleted_any:
+                        del records_by_domain[domain]
 
-        # Apply creates/updates, handling duplicates.
+        # Apply creates/updates, handling duplicates (respecting managed records).
         for domain, answer in sorted(desired.items()):
             existing_answers = records_by_domain.get(domain, [])
 
             if not existing_answers:
-                # No existing record - add it
+                # No existing record - add it and mark as managed
                 logger.info(f"Adding record {domain} -> {answer}")
                 self.dns_provider.add_record(domain, answer)
+                self._mark_record_managed(state, domain, answer)
             elif len(existing_answers) == 1 and existing_answers[0] == answer:
-                # Exactly one record with correct answer - nothing to do
-                pass
+                # Exactly one record with correct answer - adopt it as managed
+                self._mark_record_managed(state, domain, answer)
             else:
-                # Either wrong answer(s) or duplicates exist - clean up and recreate
-                if len(existing_answers) > 1:
-                    logger.warning(
-                        f"Found {len(existing_answers)} duplicate records for {domain}, consolidating"
-                    )
-                # Delete all existing entries
-                for old_answer in existing_answers:
-                    self.dns_provider.delete_record(domain, old_answer)
-                # Re-add the single correct record
-                self.dns_provider.add_record(domain, answer)
+                # Either wrong answer(s) or duplicates exist
+                # Check which records we can manage
+                managed_answers = [
+                    a for a in existing_answers if self._is_record_managed(state, domain, a)
+                ]
+                unmanaged_answers = [
+                    a for a in existing_answers if not self._is_record_managed(state, domain, a)
+                ]
+
+                if unmanaged_answers:
+                    # There are pre-existing records we didn't create
+                    if answer in unmanaged_answers:
+                        # Desired answer already exists as pre-existing - adopt it
+                        logger.debug(f"Adopting pre-existing record {domain} -> {answer}")
+                        self._mark_record_managed(state, domain, answer)
+                        # Clean up any managed duplicates
+                        for old_answer in managed_answers:
+                            if old_answer != answer:
+                                logger.info(f"Removing managed duplicate {domain} -> {old_answer}")
+                                self.dns_provider.delete_record(domain, old_answer)
+                                self._unmark_record_managed(state, domain, old_answer)
+                    else:
+                        # Pre-existing record(s) with different answer - warn and skip
+                        logger.warning(
+                            f"Domain {domain} has pre-existing record(s) {unmanaged_answers} "
+                            f"(not managed by external-dns); skipping desired {answer}"
+                        )
+                        # Still clean up our managed records for this domain
+                        for old_answer in managed_answers:
+                            logger.info(
+                                f"Removing obsolete managed record {domain} -> {old_answer}"
+                            )
+                            self.dns_provider.delete_record(domain, old_answer)
+                            self._unmark_record_managed(state, domain, old_answer)
+                else:
+                    # All records are managed by us - clean up and recreate
+                    if len(existing_answers) > 1:
+                        logger.warning(
+                            f"Found {len(existing_answers)} duplicate records for {domain}, consolidating"
+                        )
+                    # Delete all existing managed entries
+                    for old_answer in existing_answers:
+                        self.dns_provider.delete_record(domain, old_answer)
+                        self._unmark_record_managed(state, domain, old_answer)
+                    # Re-add the single correct record
+                    self.dns_provider.add_record(domain, answer)
+                    self._mark_record_managed(state, domain, answer)
 
         # Apply deletions for domains that now have no sources AND were confirmed absent.
         for domain in sorted(domains_to_delete_from_state):
@@ -1157,9 +1511,14 @@ class ExternalDNSSyncer:
             if domain in self.static_rewrites:
                 continue
 
-            # Delete all records for this domain (handles duplicates too)
+            # Delete only managed records for this domain
             for old_answer in records_by_domain.get(domain, []):
-                self.dns_provider.delete_record(domain, old_answer)
+                if self._is_record_managed(state, domain, old_answer):
+                    logger.info(f"Removing record {domain} -> {old_answer}")
+                    self.dns_provider.delete_record(domain, old_answer)
+                    self._unmark_record_managed(state, domain, old_answer)
+                else:
+                    logger.debug(f"Preserving pre-existing record {domain} -> {old_answer}")
             state["domains"].pop(domain, None)
 
         self.state_store.save(state)
@@ -1171,28 +1530,67 @@ class ExternalDNSSyncer:
 
 
 def validate_config() -> bool:
-    """Validate configuration."""
+    """Validate configuration.
+
+    Configuration priority:
+    1. YAML config file (providers section or legacy dns_provider)
+    2. Environment variables (fallback)
+    """
     errors = []
 
-    # Validate DNS provider config
-    if DNS_PROVIDER == "adguard":
-        if not ADGUARD_URL:
-            errors.append("ADGUARD_URL is required when DNS_PROVIDER=adguard")
-        if not ADGUARD_USERNAME or not ADGUARD_PASSWORD:
-            logger.warning("⚠️  ADGUARD_USERNAME/PASSWORD not set. Using unauthenticated access.")
-    else:
-        errors.append(f"Unsupported DNS_PROVIDER: {DNS_PROVIDER}. Supported: adguard")
+    # Check if YAML config file exists and has valid configuration
+    yaml_providers = load_dns_providers_from_yaml(CONFIG_PATH)
+    using_yaml_config = len(yaml_providers) > 0
 
-    # Validate proxy provider config
+    # Validate DNS provider config
+    dns_config = get_dns_config()
+    if not dns_config["url"]:
+        if using_yaml_config:
+            errors.append(
+                f"No DNS provider URL found in config file. "
+                f"Check 'providers' or 'dns_provider' section in {CONFIG_PATH}"
+            )
+        else:
+            errors.append(
+                "DNS provider URL is required. "
+                "Set via YAML config (providers[].url) or ADGUARD_URL env var."
+            )
+    else:
+        # Determine provider type from YAML or env
+        provider_type = "adguard"
+        if yaml_providers:
+            provider_type = yaml_providers[0].provider
+
+        if provider_type not in ["adguard"]:
+            errors.append(f"Unsupported DNS provider type: {provider_type}. Supported: adguard")
+        elif not dns_config["username"] or not dns_config["password"]:
+            if using_yaml_config:
+                logger.warning(
+                    "⚠️  DNS provider username/password not set in config. "
+                    "Using unauthenticated access."
+                )
+            else:
+                logger.warning(
+                    "⚠️  ADGUARD_USERNAME/PASSWORD not set. Using unauthenticated access."
+                )
+
+    # Validate proxy provider config (sources from YAML)
     if PROXY_PROVIDER == "traefik":
         try:
             provider = create_proxy_provider()
             instances = provider.get_instances()
             if not instances:
-                errors.append(
-                    "At least one Traefik instance is required "
-                    "(set TRAEFIK_INSTANCES or TRAEFIK_URL + TRAEFIK_TARGET_IP/INTERNAL_IP)"
-                )
+                config_files = find_config_files(CONFIG_PATH)
+                if config_files:
+                    errors.append(
+                        f"No sources configured in {CONFIG_PATH}. "
+                        f"Add at least one source with url and target_ip."
+                    )
+                else:
+                    errors.append(
+                        f"Config file not found: {CONFIG_PATH}. "
+                        f"Create config file or set TRAEFIK_URL + TRAEFIK_TARGET_IP env vars."
+                    )
         except Exception as e:
             errors.append(f"Failed to configure Traefik provider: {e}")
     else:
@@ -1208,6 +1606,12 @@ def validate_config() -> bool:
 
 def main():
     """Main entry point."""
+    # Load settings from config file (env vars override)
+    settings = load_settings_from_yaml(CONFIG_PATH)
+
+    # Reconfigure logging with settings from config
+    logging.getLogger().setLevel(getattr(logging, settings.log_level, logging.INFO))
+
     logger.info(f"external-dns: {PROXY_PROVIDER} -> {DNS_PROVIDER}")
 
     # Validate configuration
@@ -1216,37 +1620,41 @@ def main():
         sys.exit(1)
 
     # Create providers
+    dns_config = get_dns_config()
     dns_provider = create_dns_provider()
-    proxy_provider = create_proxy_provider()
+    proxy_provider = create_proxy_provider(default_zone=settings.default_zone)
     instances = proxy_provider.get_instances()
 
-    logger.info(f"DNS Provider: {dns_provider.name} ({ADGUARD_URL})")
+    logger.info(f"DNS Provider: {dns_provider.name} ({dns_config['url']})")
     logger.info(f"Proxy Provider: {proxy_provider.name}")
     logger.info(f"Configured {len(instances)} proxy instance(s):")
     for inst in instances:
         logger.info(f"  - {inst.name}: {inst.url} -> {inst.target_ip}")
-    logger.info(
-        f"Default zone: {EXTERNAL_DNS_DEFAULT_ZONE} (only 'internal' zones sync to local DNS)"
-    )
-    logger.info(f"Sync mode: {SYNC_MODE}")
-    if SYNC_MODE == "watch":
-        logger.info(f"Poll interval: {POLL_INTERVAL_SECONDS}s")
-        config_files = find_config_files(TRAEFIK_CONFIG_PATH)
+    logger.info(f"Default zone: {settings.default_zone} (only 'internal' zones sync to local DNS)")
+    logger.info(f"Sync mode: {settings.sync_mode}")
+    if settings.sync_mode == "watch":
+        logger.info(f"Poll interval: {settings.poll_interval}s")
+        config_files = find_config_files(CONFIG_PATH)
         if len(config_files) > 1:
-            logger.info(
-                f"Config watch: scanning {len(config_files)} files in {TRAEFIK_CONFIG_PATH}"
-            )
+            logger.info(f"Config watch: scanning {len(config_files)} files in {CONFIG_PATH}")
         else:
-            logger.info(f"Config watch: enabled for {TRAEFIK_CONFIG_PATH}")
+            logger.info(f"Config watch: enabled for {CONFIG_PATH}")
 
     # Best-effort default IP for static rewrites (use first instance target_ip).
     default_ip_for_static = instances[0].target_ip if instances else ""
-    static_rewrites = _parse_static_rewrites(EXTERNAL_DNS_STATIC_REWRITES, default_ip_for_static)
+
+    # Process static rewrites from settings (fill in default IP for entries without one)
+    static_rewrites: Dict[str, str] = {}
+    for domain, answer in settings.static_rewrites.items():
+        if answer:
+            static_rewrites[domain] = answer
+        elif default_ip_for_static:
+            static_rewrites[domain] = default_ip_for_static
     if static_rewrites:
         logger.info(f"Static rewrites: {', '.join(sorted(static_rewrites.keys()))}")
 
     # Parse domain exclusion patterns
-    exclude_patterns = _parse_exclude_patterns(EXTERNAL_DNS_EXCLUDE_DOMAINS)
+    exclude_patterns = _parse_exclude_patterns(settings.exclude_domains)
     if exclude_patterns:
         logger.info(f"Domain exclusions: {len(exclude_patterns)} pattern(s) configured")
 
@@ -1263,25 +1671,29 @@ def main():
         exclude_patterns=exclude_patterns,
     )
 
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     # Run sync
     try:
-        if SYNC_MODE == "once":
+        if settings.sync_mode == "once":
             syncer.sync_once()
             return
 
-        if SYNC_MODE != "watch":
-            logger.error(f"Invalid SYNC_MODE: {SYNC_MODE}. Use 'once' or 'watch'")
+        if settings.sync_mode != "watch":
+            logger.error(f"Invalid sync_mode: {settings.sync_mode}. Use 'once' or 'watch'")
             sys.exit(1)
 
         # Track all config files modification times for auto-reload
-        config_files = find_config_files(TRAEFIK_CONFIG_PATH)
+        config_files = find_config_files(CONFIG_PATH)
         last_config_mtimes = get_config_files_mtimes(config_files)
 
         # Cycle counter for health check logging
         cycle_count = 0
 
         # Polling loop with config file watching
-        while True:
+        while not _shutdown_event.is_set():
             cycle_count += 1
             try:
                 syncer.sync_once()
@@ -1295,7 +1707,7 @@ def main():
                 logger.info(f"Health check: {cycle_count} sync cycles completed")
 
             # Check for new config files or changes to existing ones
-            current_config_files = find_config_files(TRAEFIK_CONFIG_PATH)
+            current_config_files = find_config_files(CONFIG_PATH)
             current_mtimes = get_config_files_mtimes(current_config_files)
 
             # Detect changes: new files, deleted files, or modified files
@@ -1333,7 +1745,9 @@ def main():
 
                 # Recreate proxy provider with new config
                 try:
-                    proxy_provider = create_proxy_provider()
+                    # Reload settings for any changes
+                    settings = load_settings_from_yaml(CONFIG_PATH)
+                    proxy_provider = create_proxy_provider(default_zone=settings.default_zone)
                     instances = proxy_provider.get_instances()
                     logger.info(
                         f"Reloaded {len(instances)} instance(s): {', '.join([i.name for i in instances])}"
@@ -1349,10 +1763,10 @@ def main():
                     logger.error(f"Failed to reload configuration: {e}", exc_info=True)
                     logger.warning("Continuing with previous configuration")
 
-            time.sleep(max(5, POLL_INTERVAL_SECONDS))
+            # Interruptible sleep - will return immediately if shutdown signal received
+            _shutdown_event.wait(max(5, settings.poll_interval))
 
-    except KeyboardInterrupt:
-        logger.info("Shutting down gracefully...")
+        logger.info("Shutdown complete.")
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)

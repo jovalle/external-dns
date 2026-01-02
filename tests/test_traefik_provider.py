@@ -15,10 +15,10 @@ class TestTraefikInstanceLoadingFromYaml:
 
     def test_get_instances_from_yaml_config(self, tmp_path: Path) -> None:
         """Test loading instances from YAML config file."""
-        config_file = tmp_path / "traefik-instances.yaml"
+        config_file = tmp_path / "config.yaml"
         config_file.write_text(
             """
-instances:
+sources:
   - name: core
     url: http://traefik:8080
     target_ip: 10.0.0.2
@@ -47,10 +47,10 @@ instances:
 
     def test_get_instances_skips_invalid_entries(self, tmp_path: Path) -> None:
         """Test that entries with missing required fields are skipped."""
-        config_file = tmp_path / "traefik-instances.yaml"
+        config_file = tmp_path / "config.yaml"
         config_file.write_text(
             """
-instances:
+sources:
   - name: valid
     url: http://traefik:8080
     target_ip: 10.0.0.2

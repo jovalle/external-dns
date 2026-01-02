@@ -2,11 +2,11 @@
 
 Universal DNS synchronization service that syncs reverse proxy routes to DNS providers, inspired by [Kubernetes external-dns](https://github.com/kubernetes-sigs/external-dns).
 
-## Overview
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f4a1/512.gif" width="32" height="32" alt="light bulb"> Overview
 
 external-dns automatically discovers hostnames from your reverse proxy configuration and creates corresponding DNS records in your DNS provider. When routes are added, modified, or removed from the reverse proxy, DNS records are automatically synchronized.
 
-## Supported Providers
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f680/512.gif" width="32" height="32" alt="rocket"> Supported Providers
 
 ### DNS Providers
 
@@ -24,9 +24,8 @@ external-dns automatically discovers hostnames from your reverse proxy configura
 | Traefik             | Supported | `TRAEFIK_`         |
 | Caddy               | Planned   | -                  |
 | Nginx Proxy Manager | Planned   | -                  |
-| HAProxy             | Planned   | -                  |
 
-## Configuration
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/2699_fe0f/512.gif" width="32" height="32" alt="gear"> Configuration
 
 ### Provider Selection
 
@@ -156,7 +155,7 @@ In this setup:
 - `myapp.local.example.com` → local DNS rewrite pointing to internal Traefik IP
 - `myapp.example.com` → no local rewrite, resolved via upstream DNS (Cloudflare/Google)
 
-## Docker Compose Example
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f433/512.gif" width="32" height="32" alt="whale"> Docker Compose Example
 
 ```yaml
 services:
@@ -194,32 +193,32 @@ services:
       - ./data:/data
 ```
 
-## Environment Variables Reference
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/2728/512.gif" width="32" height="32" alt="sparkles"> Environment Variables Reference
 
 Complete list of configuration options:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DNS_PROVIDER` | `adguard` | DNS provider type |
-| `PROXY_PROVIDER` | `traefik` | Reverse proxy type |
-| `ADGUARD_URL` | `http://adguard` | AdGuard Home API URL |
-| `ADGUARD_USERNAME` | (empty) | AdGuard admin username |
-| `ADGUARD_PASSWORD` | (empty) | AdGuard admin password |
-| `TRAEFIK_CONFIG_PATH` | `/config/traefik-instances.yaml` | Path to Traefik instances config file |
-| `TRAEFIK_INSTANCES` | (empty) | JSON array of Traefik instances (overrides config file) |
-| `TRAEFIK_URL` | `http://traefik:8080` | Single-instance Traefik URL (legacy) |
-| `TRAEFIK_TARGET_IP` | (empty) | Single-instance target IP (legacy, falls back to `INTERNAL_IP`) |
-| `INTERNAL_IP` | (empty) | Fallback IP for `TRAEFIK_TARGET_IP` |
-| `SYNC_MODE` | `watch` | `once` or `watch` |
-| `POLL_INTERVAL_SECONDS` | `60` | Polling interval in watch mode |
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `STATE_PATH` | `/data/state.json` | State file location |
-| `EXTERNAL_DNS_STATIC_REWRITES` | (empty) | Static DNS rewrites |
-| `EXTERNAL_DNS_EXCLUDE_DOMAINS` | (empty) | Domain exclusion patterns |
-| `EXTERNAL_DNS_DEFAULT_ZONE` | `internal` | Default zone (`internal`/`external`) |
-| `EXTERNAL_DNS_ZONE_LABEL` | `external-dns.zone` | Custom zone label name |
+| Variable                       | Default                | Description                                                     |
+| ------------------------------ | ---------------------- | --------------------------------------------------------------- |
+| `DNS_PROVIDER`                 | `adguard`              | DNS provider type                                               |
+| `PROXY_PROVIDER`               | `traefik`              | Reverse proxy type                                              |
+| `ADGUARD_URL`                  | `http://adguard`       | AdGuard Home API URL                                            |
+| `ADGUARD_USERNAME`             | (empty)                | AdGuard admin username                                          |
+| `ADGUARD_PASSWORD`             | (empty)                | AdGuard admin password                                          |
+| `CONFIG_PATH`                  | `/config/config.yaml`  | Path to config file                                             |
+| `TRAEFIK_INSTANCES`            | (empty)                | JSON array of Traefik instances (overrides config file)         |
+| `TRAEFIK_URL`                  | `http://traefik:8080`  | Single-instance Traefik URL (legacy)                            |
+| `TRAEFIK_TARGET_IP`            | (empty)                | Single-instance target IP (legacy, falls back to `INTERNAL_IP`) |
+| `INTERNAL_IP`                  | (empty)                | Fallback IP for `TRAEFIK_TARGET_IP`                             |
+| `SYNC_MODE`                    | `watch`                | `once` or `watch`                                               |
+| `POLL_INTERVAL_SECONDS`        | `60`                   | Polling interval in watch mode                                  |
+| `LOG_LEVEL`                    | `INFO`                 | `DEBUG`, `INFO`, `WARNING`, `ERROR`                             |
+| `STATE_PATH`                   | `/data/state.json`     | State file location                                             |
+| `EXTERNAL_DNS_STATIC_REWRITES` | (empty)                | Static DNS rewrites                                             |
+| `EXTERNAL_DNS_EXCLUDE_DOMAINS` | (empty)                | Domain exclusion patterns                                       |
+| `EXTERNAL_DNS_DEFAULT_ZONE`    | `internal`             | Default zone (`internal`/`external`)                            |
+| `EXTERNAL_DNS_ZONE_LABEL`      | `external-dns.zone`    | Custom zone label name                                          |
 
-## Development
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f525/512.gif" width="32" height="32" alt="fire"> Development
 
 Prereqs: Python 3.12+
 
@@ -232,34 +231,35 @@ make pre-commit
 Common commands:
 
 ```bash
-make lint
-make format
-make test
-make build
-make docker
+make lint          # Run linter
+make format        # Format code
+make test          # Run unit tests
+make build         # Build Python package
+make run           # Run external-dns locally (requires .env)
+make stack         # Start full local test stack
 ```
 
-### Local end-to-end stack
+### <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f3af/512.gif" width="24" height="24" alt="target"> Local Test Stack
 
-`make docker` builds the local image and starts a local test stack (Traefik + AdGuard Home + external-dns).
+`make stack` (or `make docker`) builds the local image and starts a full test stack (Traefik + AdGuard Home + whoami + external-dns).
 
 - AdGuard UI/API: <http://localhost:3000> (default credentials: `admin` / `password`)
 - Traefik dashboard/API: <http://localhost:8080>
 
-## Conventional Commits and Releases
+> **Production Note:** The `docker-compose.yaml` defaults are configured for local development. For production deployments, copy `.env.example` to `.env` and update service URLs, credentials, IP addresses, and ports to match your environment. See `.env.example` for detailed documentation of all available configuration options.
+
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f389/512.gif" width="32" height="32" alt="party popper"> Releases
 
 - Commit messages are validated locally via `pre-commit` (commit-msg hook) and in CI.
 - Versioning and releases are automated on `main` via GitHub Actions using semantic versioning derived from Conventional Commits.
 
-## GitHub Actions
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f916/512.gif" width="32" height="32" alt="robot"> GitHub Actions
 
 - CI: lint + format check + tests + Python package build
 - Docker: builds (and pushes on `main`/tags) to GitHub Container Registry (GHCR)
 - Release: bumps version, updates `CHANGELOG.md`, tags `vX.Y.Z`, and creates a GitHub release
 
-See the sample compose and config in `examples/`.
-
-## How It Works
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f4ab/512.gif" width="32" height="32" alt="dizzy"> How It Works
 
 1. **Discovery**: Polls the reverse proxy API to discover configured routes/hostnames
 2. **Reconciliation**: Compares discovered hostnames against current DNS records
@@ -281,7 +281,7 @@ Records are only deleted when:
 - The hostname is confirmed absent from a successfully polled instance
 - If an instance is unreachable, its records are preserved until the next successful poll
 
-## Adding New Providers
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f31f/512.gif" width="32" height="32" alt="glowing star"> Adding New Providers
 
 The codebase uses an abstract provider pattern. To add a new provider:
 
@@ -292,7 +292,7 @@ The codebase uses an abstract provider pattern. To add a new provider:
 
 See the existing `AdGuardDNSProvider` and `TraefikProxyProvider` implementations as examples.
 
-## Troubleshooting
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/2753/512.gif" width="32" height="32" alt="question"> Troubleshooting
 
 ### Enable Debug Logging
 
@@ -310,3 +310,12 @@ environment:
 ### Retry Behavior
 
 Transient network errors are automatically retried with exponential backoff (up to 3 attempts). If errors persist, check your network connectivity and provider status.
+
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f64f/512.gif" width="32" height="32" alt="thanks"> Kudos
+
+[Kubernetes external-dns](https://github.com/kubernetes-sigs/external-dns)
+[Get Shit Done](https://github.com/glittercowboy/get-shit-done) (GSD)
+
+## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f3c1/512.gif" width="32" height="32" alt="checkered flag"> License
+
+MIT License. See `LICENSE` file for details.

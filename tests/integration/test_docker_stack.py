@@ -383,9 +383,9 @@ def test_local_stack_syncs_traefik_routes_to_adguard() -> None:
     env.setdefault("IMAGE", "external-dns:local")
 
     # Derive expected target IP from the same config external-dns reads.
-    traefik_cfg = repo / "docker" / "local" / "external-dns" / "config" / "traefik-instances.yaml"
+    traefik_cfg = repo / "docker" / "local" / "external-dns" / "config" / "config.yaml"
     cfg_obj = yaml.safe_load(traefik_cfg.read_text(encoding="utf-8"))
-    expected_target_ip = str(cfg_obj["instances"][0]["target_ip"]).strip()
+    expected_target_ip = str(cfg_obj["sources"][0]["target_ip"]).strip()
 
     def dc(*args: str) -> subprocess.CompletedProcess:
         """Run docker compose command with project context."""

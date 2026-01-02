@@ -410,8 +410,8 @@ def test_find_config_files_nonexistent_path() -> None:
 def test_find_config_files_excludes_template_suffix() -> None:
     """Files ending with .template are excluded even if they contain .yaml."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        template = Path(tmpdir) / "traefik.yaml.template"
-        regular = Path(tmpdir) / "traefik.yaml"
+        template = Path(tmpdir) / "config.yaml.template"
+        regular = Path(tmpdir) / "config.yaml"
 
         template.write_text("# template file")
         regular.write_text("instances: []")

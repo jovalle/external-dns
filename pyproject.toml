@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "external-dns"
+version = "1.0.0"
+description = "Universal DNS synchronization service that syncs reverse proxy routes to DNS providers"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{name = "external-dns contributors"}]
+keywords = ["dns", "adguard", "traefik", "external-dns"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "PyYAML>=6.0.2",
+  "requests>=2.32.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2.2",
+  "pre-commit>=3.8.0",
+  "pytest>=8.3.0",
+  "pytest-cov>=5.0.0",
+  "ruff>=0.8.4",
+  "commitizen>=3.29.1",
+  "python-semantic-release>=9.12.0",
+]
+
+[project.scripts]
+external-dns = "external_dns.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"external-dns.py" = ["E402", "I001"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+markers = [
+  "integration: Docker-compose based end-to-end tests",
+]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+version = "1.0.0"
+version_files = [
+  "src/external_dns/__init__.py:__version__",
+  "pyproject.toml:project.version",
+]
+
+[tool.semantic_release]
+version_variables = ["src/external_dns/__init__.py:__version__"]
+version_toml = ["pyproject.toml:project.version"]
+branch = "main"
+tag_format = "v{version}"
+commit_message = "chore(release): v{version}"
+commit_parser = "conventional"
+changelog_file = "CHANGELOG.md"
+build_command = "python -m build"
+
+[tool.semantic_release.remote]
+name = "origin"
+
+[tool.semantic_release.publish]
+upload_to_vcs_release = true

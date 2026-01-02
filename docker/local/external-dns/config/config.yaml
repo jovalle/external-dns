@@ -1,0 +1,17 @@
+---
+# DNS providers - where DNS records are written
+providers:
+  - name: local-adguard
+    provider: adguard
+    url: "http://adguard:3000"
+    username: "admin"
+    password: "password"
+
+# Sources - reverse proxy instances to discover routes from
+sources:
+  - name: local-traefik
+    type: traefik
+    url: "http://traefik:8080"
+    target_ip: "172.52.0.11"
+    verify_tls: false
+    router_filter: ""
