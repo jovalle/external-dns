@@ -253,9 +253,9 @@ def _assert_rewrite_exists(
         if entry.get("domain") == domain:
             if expected_answer is not None:
                 actual = str(entry.get("answer", "")).strip()
-                assert (
-                    actual == expected_answer
-                ), f"Rewrite for '{domain}' has wrong answer: expected={expected_answer}, got={actual}"
+                assert actual == expected_answer, (
+                    f"Rewrite for '{domain}' has wrong answer: expected={expected_answer}, got={actual}"
+                )
             return
     raise AssertionError(f"Rewrite not found for domain '{domain}'. Rewrites: {rewrites}")
 
@@ -446,9 +446,9 @@ def test_local_stack_syncs_traefik_routes_to_adguard() -> None:
         ps_out = dc_ok("ps")
         ps_text = ps_out.stdout
         for service_name in ("adguard", "traefik", "whoami", "external-dns"):
-            assert (
-                service_name in ps_text
-            ), f"Missing service in `docker compose ps`: {service_name}\n{ps_text}"
+            assert service_name in ps_text, (
+                f"Missing service in `docker compose ps`: {service_name}\n{ps_text}"
+            )
 
         # -------------------------------------------------------------------
         # Scenario: external-dns health check
@@ -480,15 +480,15 @@ def test_local_stack_syncs_traefik_routes_to_adguard() -> None:
         rewrite = _wait_for_rewrite(
             dc, "whoami-internal.localtest.me", expected_target_ip, timeout_seconds=90
         )
-        assert (
-            rewrite is not None
-        ), "Expected DNS rewrite for 'whoami-internal.localtest.me' not found"
+        assert rewrite is not None, (
+            "Expected DNS rewrite for 'whoami-internal.localtest.me' not found"
+        )
 
         # Validate the answer matches expected target IP
         found_answer = str(rewrite.get("answer", "")).strip()
-        assert (
-            found_answer == expected_target_ip
-        ), f"Rewrite had unexpected answer. expected={expected_target_ip} got={found_answer}"
+        assert found_answer == expected_target_ip, (
+            f"Rewrite had unexpected answer. expected={expected_target_ip} got={found_answer}"
+        )
         _step(f"Found rewrite: {rewrite.get('domain')} -> {rewrite.get('answer')}")
 
         # -------------------------------------------------------------------
