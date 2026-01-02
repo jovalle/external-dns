@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "external-dns"
-version = "1.0.0"
+version = "1.0.1"
 description = "Universal DNS synchronization service that syncs reverse proxy routes to DNS providers"
 readme = "README.md"
 requires-python = ">=3.12"
