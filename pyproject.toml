@@ -74,17 +74,9 @@ version_files = [
 ]
 
 [tool.semantic_release]
-version_variables = ["src/external_dns/__init__.py:__version__"]
 version_toml = ["pyproject.toml:project.version"]
+version_variables = ["src/external_dns/__init__.py:__version__"]
 branch = "main"
 tag_format = "v{version}"
-commit_message = "chore(release): v{version}"
-commit_parser = "conventional"
-changelog_file = "CHANGELOG.md"
 build_command = "python -m build"
-
-[tool.semantic_release.remote]
-name = "origin"
-
-[tool.semantic_release.publish]
 upload_to_vcs_release = true
