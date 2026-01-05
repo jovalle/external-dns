@@ -155,6 +155,36 @@ In this setup:
 - `myapp.local.example.com` → local DNS rewrite pointing to internal Traefik IP
 - `myapp.example.com` → no local rewrite, resolved via upstream DNS (Cloudflare/Google)
 
+### Post-Sync Webhooks
+
+Trigger external services (like [adguardhome-sync](https://github.com/bakito/adguardhome-sync)) after DNS record changes to synchronize across replicas.
+
+```yaml
+environment:
+  EXTERNAL_DNS_WEBHOOK_URL: 'http://adguardhome-sync:8080/api/v1/sync'
+  EXTERNAL_DNS_WEBHOOK_USERNAME: 'admin' # Optional: HTTP Basic Auth
+  EXTERNAL_DNS_WEBHOOK_PASSWORD: 'secret' # Optional: HTTP Basic Auth
+  EXTERNAL_DNS_WEBHOOK_METHOD: 'POST' # HTTP method (default: POST)
+  EXTERNAL_DNS_WEBHOOK_TIMEOUT: '30' # Request timeout in seconds (default: 30)
+  EXTERNAL_DNS_WEBHOOK_ONLY_ON_CHANGES: 'true' # Only trigger when records change (default: true)
+```
+
+Or via YAML config file:
+
+```yaml
+webhook:
+  url: 'http://adguardhome-sync:8080/api/v1/sync'
+  username: 'admin'
+  password: 'secret'
+  method: 'POST'
+  timeout: 30
+  only_on_changes: true
+```
+
+**Use Case: AdGuard Home Replicas**
+
+When running multiple AdGuard Home instances behind a load balancer, external-dns writes to the primary instance. The webhook triggers adguardhome-sync to propagate changes to all replicas, ensuring consistent DNS resolution regardless of which replica handles the query.
+
 ## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f433/512.gif" width="32" height="32" alt="whale"> Docker Compose Example
 
 ```yaml
@@ -197,26 +227,32 @@ services:
 
 Complete list of configuration options:
 
-| Variable                       | Default                | Description                                                     |
-| ------------------------------ | ---------------------- | --------------------------------------------------------------- |
-| `DNS_PROVIDER`                 | `adguard`              | DNS provider type                                               |
-| `PROXY_PROVIDER`               | `traefik`              | Reverse proxy type                                              |
-| `ADGUARD_URL`                  | `http://adguard`       | AdGuard Home API URL                                            |
-| `ADGUARD_USERNAME`             | (empty)                | AdGuard admin username                                          |
-| `ADGUARD_PASSWORD`             | (empty)                | AdGuard admin password                                          |
-| `CONFIG_PATH`                  | `/config/config.yaml`  | Path to config file                                             |
-| `TRAEFIK_INSTANCES`            | (empty)                | JSON array of Traefik instances (overrides config file)         |
-| `TRAEFIK_URL`                  | `http://traefik:8080`  | Single-instance Traefik URL (legacy)                            |
-| `TRAEFIK_TARGET_IP`            | (empty)                | Single-instance target IP (legacy, falls back to `INTERNAL_IP`) |
-| `INTERNAL_IP`                  | (empty)                | Fallback IP for `TRAEFIK_TARGET_IP`                             |
-| `SYNC_MODE`                    | `watch`                | `once` or `watch`                                               |
-| `POLL_INTERVAL_SECONDS`        | `60`                   | Polling interval in watch mode                                  |
-| `LOG_LEVEL`                    | `INFO`                 | `DEBUG`, `INFO`, `WARNING`, `ERROR`                             |
-| `STATE_PATH`                   | `/data/state.json`     | State file location                                             |
-| `EXTERNAL_DNS_STATIC_REWRITES` | (empty)                | Static DNS rewrites                                             |
-| `EXTERNAL_DNS_EXCLUDE_DOMAINS` | (empty)                | Domain exclusion patterns                                       |
-| `EXTERNAL_DNS_DEFAULT_ZONE`    | `internal`             | Default zone (`internal`/`external`)                            |
-| `EXTERNAL_DNS_ZONE_LABEL`      | `external-dns.zone`    | Custom zone label name                                          |
+| Variable                            | Default                | Description                                                     |
+| ----------------------------------- | ---------------------- | --------------------------------------------------------------- |
+| `DNS_PROVIDER`                      | `adguard`              | DNS provider type                                               |
+| `PROXY_PROVIDER`                    | `traefik`              | Reverse proxy type                                              |
+| `ADGUARD_URL`                       | `http://adguard`       | AdGuard Home API URL                                            |
+| `ADGUARD_USERNAME`                  | (empty)                | AdGuard admin username                                          |
+| `ADGUARD_PASSWORD`                  | (empty)                | AdGuard admin password                                          |
+| `CONFIG_PATH`                       | `/config/config.yaml`  | Path to config file                                             |
+| `TRAEFIK_INSTANCES`                 | (empty)                | JSON array of Traefik instances (overrides config file)         |
+| `TRAEFIK_URL`                       | `http://traefik:8080`  | Single-instance Traefik URL (legacy)                            |
+| `TRAEFIK_TARGET_IP`                 | (empty)                | Single-instance target IP (legacy, falls back to `INTERNAL_IP`) |
+| `INTERNAL_IP`                       | (empty)                | Fallback IP for `TRAEFIK_TARGET_IP`                             |
+| `SYNC_MODE`                         | `watch`                | `once` or `watch`                                               |
+| `POLL_INTERVAL_SECONDS`             | `60`                   | Polling interval in watch mode                                  |
+| `LOG_LEVEL`                         | `INFO`                 | `DEBUG`, `INFO`, `WARNING`, `ERROR`                             |
+| `STATE_PATH`                        | `/data/state.json`     | State file location                                             |
+| `EXTERNAL_DNS_STATIC_REWRITES`      | (empty)                | Static DNS rewrites                                             |
+| `EXTERNAL_DNS_EXCLUDE_DOMAINS`      | (empty)                | Domain exclusion patterns                                       |
+| `EXTERNAL_DNS_DEFAULT_ZONE`         | `internal`             | Default zone (`internal`/`external`)                            |
+| `EXTERNAL_DNS_ZONE_LABEL`           | `external-dns.zone`    | Custom zone label name                                          |
+| `EXTERNAL_DNS_WEBHOOK_URL`          | (empty)                | Webhook URL to call after sync                                  |
+| `EXTERNAL_DNS_WEBHOOK_USERNAME`     | (empty)                | Webhook HTTP Basic Auth username                                |
+| `EXTERNAL_DNS_WEBHOOK_PASSWORD`     | (empty)                | Webhook HTTP Basic Auth password                                |
+| `EXTERNAL_DNS_WEBHOOK_METHOD`       | `POST`                 | Webhook HTTP method                                             |
+| `EXTERNAL_DNS_WEBHOOK_TIMEOUT`      | `30`                   | Webhook request timeout (seconds)                               |
+| `EXTERNAL_DNS_WEBHOOK_ONLY_ON_CHANGES` | `true`              | Only call webhook when DNS records change                       |
 
 ## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f525/512.gif" width="32" height="32" alt="fire"> Development
 
@@ -264,7 +300,8 @@ make stack         # Start full local test stack
 1. **Discovery**: Polls the reverse proxy API to discover configured routes/hostnames
 2. **Reconciliation**: Compares discovered hostnames against current DNS records
 3. **Synchronization**: Creates, updates, or deletes DNS records to match the desired state
-4. **State Management**: Maintains state to handle multi-instance deployments and graceful cleanup
+4. **Webhook**: Triggers configured webhook (e.g., adguardhome-sync) when records change
+5. **State Management**: Maintains state to handle multi-instance deployments and graceful cleanup
 
 ### Multi-Instance Behavior
 
