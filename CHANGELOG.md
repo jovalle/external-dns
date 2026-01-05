@@ -1,6 +1,28 @@
 # CHANGELOG
 
 
+## v1.1.0 (2026-01-05)
+
+### Documentation
+
+* docs: add webhook documentation and config templates
+
+  - Document post-sync webhook feature in README
+  - Add webhook env vars to reference table
+  - Update .env.example with webhook section
+  - Add webhook config to YAML template ([`58c94b2`](https://github.com/jovalle/external-dns/commit/58c94b2b512839449115b9e2a23245e9256293d8))
+
+### Features
+
+* feat(webhook): add post-sync webhook support
+
+  - Add WebhookConfig dataclass for configuration
+  - Add call_webhook function with retry logic
+  - Integrate webhook calls after sync operations
+  - Trigger on changes only (configurable)
+  - Support HTTP Basic Auth ([`8044503`](https://github.com/jovalle/external-dns/commit/80445039831285573b2c64fc0ac0f9f7d29ffd14))
+
+
 ## v1.0.1 (2026-01-02)
 
 ### Bug Fixes
