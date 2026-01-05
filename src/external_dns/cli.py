@@ -209,6 +209,70 @@ def get_config_files_mtimes(config_files: List[str]) -> Dict[str, float]:
     return {f: get_config_file_mtime(f) for f in config_files}
 
 
+# =============================================================================
+# Webhook Utilities
+# =============================================================================
+
+
+def call_webhook(
+    url: str,
+    *,
+    method: str = "POST",
+    username: str = "",
+    password: str = "",
+    timeout: int = 30,
+    max_retries: int = 2,
+) -> bool:
+    """Call a webhook URL with retry logic.
+
+    This is used to trigger external services (e.g., adguardhome-sync) after
+    DNS record changes.
+
+    Args:
+        url: Webhook URL to call
+        method: HTTP method (default: POST)
+        username: Optional HTTP Basic Auth username
+        password: Optional HTTP Basic Auth password
+        timeout: Request timeout in seconds
+        max_retries: Maximum number of retry attempts
+
+    Returns:
+        True if webhook call succeeded, False otherwise
+    """
+    if not url:
+        return False
+
+    auth = HTTPBasicAuth(username, password) if username and password else None
+
+    def make_request() -> requests.Response:
+        return requests.request(
+            method=method,
+            url=url,
+            auth=auth,
+            timeout=timeout,
+            headers={"User-Agent": "external-dns/1.0"},
+        )
+
+    try:
+        response = retry_with_backoff(
+            make_request,
+            max_retries=max_retries,
+            base_delay=1.0,
+            max_delay=10.0,
+        )
+        if response.ok:
+            logger.info(f"Webhook called successfully: {method} {url} -> {response.status_code}")
+            return True
+        else:
+            logger.warning(
+                f"Webhook returned non-success status: {method} {url} -> {response.status_code}"
+            )
+            return False
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Webhook call failed after retries: {method} {url} -> {e}")
+        return False
+
+
 @dataclass
 class DNSProviderConfig:
     """Configuration for a DNS provider."""
@@ -319,6 +383,23 @@ def load_dns_config_from_yaml(config_path: str) -> Optional[Dict[str, str]]:
 
 
 @dataclass
+class WebhookConfig:
+    """Configuration for post-sync webhook notifications."""
+
+    url: str = ""
+    username: str = ""
+    password: str = ""
+    method: str = "POST"
+    timeout: int = 30
+    only_on_changes: bool = True
+
+    @property
+    def enabled(self) -> bool:
+        """Check if webhook is configured and enabled."""
+        return bool(self.url)
+
+
+@dataclass
 class RuntimeSettings:
     """Runtime configuration settings."""
 
@@ -328,12 +409,15 @@ class RuntimeSettings:
     default_zone: str = "internal"
     exclude_domains: List[str] = None  # type: ignore
     static_rewrites: Dict[str, str] = None  # type: ignore
+    webhook: WebhookConfig = None  # type: ignore
 
     def __post_init__(self):
         if self.exclude_domains is None:
             self.exclude_domains = []
         if self.static_rewrites is None:
             self.static_rewrites = {}
+        if self.webhook is None:
+            self.webhook = WebhookConfig()
 
 
 def load_settings_from_yaml(config_path: str) -> RuntimeSettings:
@@ -385,6 +469,18 @@ def load_settings_from_yaml(config_path: str) -> RuntimeSettings:
                         str(k).strip(): str(v).strip() for k, v in rewrites.items() if k
                     }
 
+            # Load webhook configuration
+            if "webhook" in config_data and isinstance(config_data["webhook"], dict):
+                w = config_data["webhook"]
+                settings.webhook = WebhookConfig(
+                    url=str(w.get("url") or "").strip(),
+                    username=str(w.get("username") or "").strip(),
+                    password=str(w.get("password") or "").strip(),
+                    method=str(w.get("method") or "POST").strip().upper(),
+                    timeout=int(w.get("timeout", 30)),
+                    only_on_changes=bool(w.get("only_on_changes", True)),
+                )
+
         except Exception:
             # Log at debug since logger may not be configured yet
             pass  # Will use defaults
@@ -420,6 +516,21 @@ def load_settings_from_yaml(config_path: str) -> RuntimeSettings:
             else:
                 # Will use first instance target_ip as default (handled later)
                 settings.static_rewrites[item] = ""
+
+    # Webhook env var overrides (EXTERNAL_DNS_WEBHOOK_*)
+    if os.getenv("EXTERNAL_DNS_WEBHOOK_URL"):
+        settings.webhook.url = os.getenv("EXTERNAL_DNS_WEBHOOK_URL", "").strip()
+    if os.getenv("EXTERNAL_DNS_WEBHOOK_USERNAME"):
+        settings.webhook.username = os.getenv("EXTERNAL_DNS_WEBHOOK_USERNAME", "").strip()
+    if os.getenv("EXTERNAL_DNS_WEBHOOK_PASSWORD"):
+        settings.webhook.password = os.getenv("EXTERNAL_DNS_WEBHOOK_PASSWORD", "").strip()
+    if os.getenv("EXTERNAL_DNS_WEBHOOK_METHOD"):
+        settings.webhook.method = os.getenv("EXTERNAL_DNS_WEBHOOK_METHOD", "POST").strip().upper()
+    if os.getenv("EXTERNAL_DNS_WEBHOOK_TIMEOUT"):
+        settings.webhook.timeout = int(os.getenv("EXTERNAL_DNS_WEBHOOK_TIMEOUT", "30"))
+    if os.getenv("EXTERNAL_DNS_WEBHOOK_ONLY_ON_CHANGES"):
+        val = os.getenv("EXTERNAL_DNS_WEBHOOK_ONLY_ON_CHANGES", "true").strip().lower()
+        settings.webhook.only_on_changes = val in ("true", "1", "yes")
 
     return settings
 
@@ -1185,10 +1296,12 @@ class ExternalDNSSyncer:
             if not managed[domain]:
                 del managed[domain]
 
-    def _sync_static_rewrites(self, state: Dict[str, Any]) -> None:
+    def _sync_static_rewrites(self, state: Dict[str, Any]) -> int:
+        """Sync static rewrites and return the number of changes made."""
         if not self.static_rewrites:
-            return
+            return 0
 
+        changes = 0
         current_records = {r.domain: r.answer for r in self.dns_provider.get_records()}
 
         for domain, answer in self.static_rewrites.items():
@@ -1203,6 +1316,7 @@ class ExternalDNSSyncer:
                     self.dns_provider.update_record(domain, current_answer, answer)
                     self._unmark_record_managed(state, domain, current_answer)
                     self._mark_record_managed(state, domain, answer)
+                    changes += 1
                 else:
                     # Pre-existing record not managed by us - warn and skip
                     logger.warning(
@@ -1213,18 +1327,26 @@ class ExternalDNSSyncer:
                 logger.info(f"Adding static rewrite {domain} -> {answer}")
                 self.dns_provider.add_record(domain, answer)
                 self._mark_record_managed(state, domain, answer)
+                changes += 1
+
+        return changes
 
     def _cleanup_removed_instances(
         self, state: Dict[str, Any], instances: List[ProxyInstance]
-    ) -> None:
-        """Remove all DNS records from proxy instances that are no longer configured."""
+    ) -> int:
+        """Remove all DNS records from proxy instances that are no longer configured.
+
+        Returns:
+            Number of DNS record changes made.
+        """
         configured_names = {i.name for i in instances}
         state_instances = state.get("instances", {})
         removed_instances = set(state_instances.keys()) - configured_names
 
         if not removed_instances:
-            return
+            return 0
 
+        changes = 0
         logger.info(f"Detected removed proxy instances: {', '.join(sorted(removed_instances))}")
 
         # Get current DNS records for cleanup
@@ -1264,6 +1386,7 @@ class ExternalDNSSyncer:
                     )
                     self.dns_provider.delete_record(domain, answer)
                     self._unmark_record_managed(state, domain, answer)
+                    changes += 1
                 else:
                     logger.debug(
                         f"Skipping pre-existing record during instance cleanup: {domain} -> {answer}"
@@ -1277,7 +1400,15 @@ class ExternalDNSSyncer:
             state["instances"].pop(removed_name, None)
             logger.info(f"Cleaned up state for removed instance: {removed_name}")
 
-    def sync_once(self) -> None:
+        return changes
+
+    def sync_once(self) -> bool:
+        """Run a single sync cycle.
+
+        Returns:
+            True if any DNS records were added, updated, or deleted; False otherwise.
+        """
+        changes_made = 0
         now = int(time.time())
         state = self.state_store.load()
         state.setdefault("version", 1)
@@ -1289,11 +1420,11 @@ class ExternalDNSSyncer:
 
         # On first sync after startup, clean up records from removed proxy instances
         if not self._startup_cleanup_done:
-            self._cleanup_removed_instances(state, instances)
+            changes_made += self._cleanup_removed_instances(state, instances)
             self._startup_cleanup_done = True
 
         # Ensure static rewrites first.
-        self._sync_static_rewrites(state)
+        changes_made += self._sync_static_rewrites(state)
 
         instance_success: Dict[str, bool] = {}
         instance_seen_domains: Dict[str, Set[str]] = {}
@@ -1433,6 +1564,7 @@ class ExternalDNSSyncer:
                             logger.info(f"Removing excluded domain from DNS: {domain} -> {answer}")
                             self.dns_provider.delete_record(domain, answer)
                             self._unmark_record_managed(state, domain, answer)
+                            changes_made += 1
                             deleted_any = True
                         else:
                             logger.debug(
@@ -1453,6 +1585,7 @@ class ExternalDNSSyncer:
                 logger.info(f"Adding record {domain} -> {answer}")
                 self.dns_provider.add_record(domain, answer)
                 self._mark_record_managed(state, domain, answer)
+                changes_made += 1
             elif len(existing_answers) == 1 and existing_answers[0] == answer:
                 # Exactly one record with correct answer - adopt it as managed
                 self._mark_record_managed(state, domain, answer)
@@ -1478,6 +1611,7 @@ class ExternalDNSSyncer:
                                 logger.info(f"Removing managed duplicate {domain} -> {old_answer}")
                                 self.dns_provider.delete_record(domain, old_answer)
                                 self._unmark_record_managed(state, domain, old_answer)
+                                changes_made += 1
                     else:
                         # Pre-existing record(s) with different answer - warn and skip
                         logger.warning(
@@ -1491,6 +1625,7 @@ class ExternalDNSSyncer:
                             )
                             self.dns_provider.delete_record(domain, old_answer)
                             self._unmark_record_managed(state, domain, old_answer)
+                            changes_made += 1
                 else:
                     # All records are managed by us - clean up and recreate
                     if len(existing_answers) > 1:
@@ -1501,9 +1636,11 @@ class ExternalDNSSyncer:
                     for old_answer in existing_answers:
                         self.dns_provider.delete_record(domain, old_answer)
                         self._unmark_record_managed(state, domain, old_answer)
+                        changes_made += 1
                     # Re-add the single correct record
                     self.dns_provider.add_record(domain, answer)
                     self._mark_record_managed(state, domain, answer)
+                    changes_made += 1
 
         # Apply deletions for domains that now have no sources AND were confirmed absent.
         for domain in sorted(domains_to_delete_from_state):
@@ -1517,11 +1654,17 @@ class ExternalDNSSyncer:
                     logger.info(f"Removing record {domain} -> {old_answer}")
                     self.dns_provider.delete_record(domain, old_answer)
                     self._unmark_record_managed(state, domain, old_answer)
+                    changes_made += 1
                 else:
                     logger.debug(f"Preserving pre-existing record {domain} -> {old_answer}")
             state["domains"].pop(domain, None)
 
         self.state_store.save(state)
+
+        if changes_made > 0:
+            logger.info(f"Sync completed with {changes_made} DNS record change(s)")
+
+        return changes_made > 0
 
 
 # =============================================================================
@@ -1658,6 +1801,14 @@ def main():
     if exclude_patterns:
         logger.info(f"Domain exclusions: {len(exclude_patterns)} pattern(s) configured")
 
+    # Log webhook configuration
+    if settings.webhook.enabled:
+        logger.info(f"Webhook: {settings.webhook.method} {settings.webhook.url}")
+        if settings.webhook.only_on_changes:
+            logger.info("  - Triggered only when DNS records change")
+        else:
+            logger.info("  - Triggered on every sync cycle")
+
     # Test connection
     if not dns_provider.test_connection():
         logger.error(f"Cannot connect to {dns_provider.name}. Exiting.")
@@ -1675,10 +1826,36 @@ def main():
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
 
+    # Helper function to run sync and trigger webhook if appropriate
+    def run_sync_with_webhook() -> bool:
+        """Run sync and call webhook if configured.
+
+        Returns:
+            True if sync completed successfully with changes, False otherwise.
+        """
+        try:
+            changes_made = syncer.sync_once()
+
+            # Call webhook if configured
+            if settings.webhook.enabled:
+                should_call = not settings.webhook.only_on_changes or changes_made
+                if should_call:
+                    call_webhook(
+                        url=settings.webhook.url,
+                        method=settings.webhook.method,
+                        username=settings.webhook.username,
+                        password=settings.webhook.password,
+                        timeout=settings.webhook.timeout,
+                    )
+
+            return changes_made
+        except Exception as e:
+            raise e
+
     # Run sync
     try:
         if settings.sync_mode == "once":
-            syncer.sync_once()
+            run_sync_with_webhook()
             return
 
         if settings.sync_mode != "watch":
@@ -1696,7 +1873,7 @@ def main():
         while not _shutdown_event.is_set():
             cycle_count += 1
             try:
-                syncer.sync_once()
+                run_sync_with_webhook()
             except Exception as e:
                 logger.error(f"Sync cycle {cycle_count} failed: {e}", exc_info=True)
                 # Continue to next cycle - don't crash the daemon
@@ -1758,7 +1935,7 @@ def main():
 
                     # Trigger immediate sync after config reload
                     logger.info("Triggering immediate sync after config reload")
-                    syncer.sync_once()
+                    run_sync_with_webhook()
                 except Exception as e:
                     logger.error(f"Failed to reload configuration: {e}", exc_info=True)
                     logger.warning("Continuing with previous configuration")
