@@ -1,6 +1,13 @@
 # CHANGELOG
 
 
+## v1.2.1 (2026-07-09)
+
+### Bug Fixes
+
+* fix(github): tag images and restore latest tag ([`0fb786a`](https://github.com/jovalle/external-dns/commit/0fb786a30ea0edda9a9ceb2b60a46ecd3e66048b))
+
+
 ## v1.2.0 (2026-07-09)
 
 ### Features
