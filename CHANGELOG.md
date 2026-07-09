@@ -1,6 +1,13 @@
 # CHANGELOG
 
 
+## v1.2.0 (2026-07-09)
+
+### Features
+
+* feat: add support for Technitium ([`430bedb`](https://github.com/jovalle/external-dns/commit/430bedbd51f0d96cb966c957478c3ffef29aa54a))
+
+
 ## v1.1.0 (2026-01-05)
 
 ### Documentation
