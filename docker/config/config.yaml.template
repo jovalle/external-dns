@@ -1,8 +1,8 @@
 # external-dns configuration
 # Syncs routes from reverse proxy sources to DNS providers
 ---
-# DNS providers - where DNS records are written
-# Supports multiple providers (first one is primary)
+# DNS providers - independent write targets where DNS records are reconciled
+# Add one or more providers. Each configured provider is reconciled separately.
 providers:
   - name: adguard-home
     provider: adguard # Provider type: adguard (default)
@@ -10,11 +10,26 @@ providers:
     username: "${DNS_PROVIDER_USERNAME}"
     password: "${DNS_PROVIDER_PASSWORD}"
 
+#  - name: technitium-primary
+#    provider: technitium
+#    url: "${TECHNITIUM_URL}"
+#    api_token: "${TECHNITIUM_API_TOKEN}"
+#    zones:
+#      - "${DOMAIN}"
+#
+#  - name: technitium-secondary
+#    provider: technitium
+#    url: "${TECHNITIUM_SECONDARY_URL}"
+#    api_token: "${TECHNITIUM_SECONDARY_API_TOKEN}"
+#    zones:
+#      - "${DOMAIN}"
+
 # Sources - reverse proxy instances to discover routes from
 sources:
-  - name: mothership
-    url: "https://traefik.mothership.${DOMAIN}"
-    target_ip: "100.100.1.1"
+  - name: primary
+    type: traefik # Source type: traefik (default)
+    url: "https://traefik-primary.${DOMAIN}"
+    target_ip: "192.168.1.10"
     # verify_tls: false
 
     # Optional: Filter routers to sync (supports wildcards)
@@ -29,14 +44,19 @@ sources:
     # Filter by middleware (only sync routers using this middleware)
     middleware_filter: "internal"
 
-  - name: stargate
-    type: traefik # Provider type: traefik, nginx, etc. (default: traefik)
-    url: "https://traefik.stargate.${DOMAIN}"
-    target_ip: "192.168.1.2"
+  - name: public-edge
+    type: traefik
+    url: "https://traefik-public.${DOMAIN}"
+    target_ip: "192.168.1.20"
+    # Optional: public_target_ip is used only for external/public routers.
+    # Internal routers from this source continue to use target_ip.
+    # External routers without public_target_ip remain skipped by default.
+    public_target_ip: "${PUBLIC_TARGET_IP}"
 
-  - name: nexus
-    url: "https://traefik.nexus.${DOMAIN}"
-    target_ip: "192.168.1.3"
+  - name: secondary
+    type: traefik
+    url: "https://traefik-secondary.${DOMAIN}"
+    target_ip: "192.168.1.30"
 
 # Runtime settings (env vars override if set)
 settings:
@@ -51,23 +71,21 @@ settings:
 
   # Default zone for discovered routes: "internal" or "external"
   # - internal: Create DNS rewrites in local DNS provider
-  # - external: Skip local DNS (queries forwarded to upstream)
+  # - external: Skip local DNS by default unless source public_target_ip is set
   default_zone: internal
 
 # Domain exclusion patterns
 # Supports: exact match, wildcards (*.example.com), regex (~^dev-\d+\.example\.com$)
 exclude_domains:
   # Exclude Traefik dashboard URLs (management interfaces)
-  - "*.mothership.${DOMAIN}"
-  - "*.stargate.${DOMAIN}"
-  - "*.nexus.${DOMAIN}"
+  - "traefik-primary.${DOMAIN}"
+  - "traefik-public.${DOMAIN}"
+  - "traefik-secondary.${DOMAIN}"
 
 # Static DNS rewrites (always ensured, not auto-removed)
 # Format: domain: ip_or_cname
 static_rewrites:
-  "*.stargate.${DOMAIN}": "192.168.1.2"
-  "*.mothership.${DOMAIN}": "100.100.1.1"
-  "*.nexus.${DOMAIN}": "192.168.1.3"
+  "static.${DOMAIN}": "192.168.1.10"
 
 # Webhook - trigger external services after DNS changes
 # Useful for triggering adguardhome-sync or other automation

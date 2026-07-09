@@ -33,3 +33,6 @@ htmlcov/
 # IDE
 .vscode/
 .env
+
+# GSD
+.planning/

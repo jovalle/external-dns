@@ -2,9 +2,10 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
-from external_dns.cli import AdGuardDNSProvider, DNSRecord
+from external_dns.cli import AdGuardDNSProvider, DNSProviderReadError, DNSRecord
 
 
 class TestAdGuardConnection:
@@ -67,8 +68,8 @@ class TestAdGuardGetRecords:
             assert records[1] == DNSRecord(domain="api.example.com", answer="10.0.0.2")
             mock_get.assert_called_once_with("http://adguard.local/control/rewrite/list", timeout=5)
 
-    def test_get_records_returns_empty_on_error(self) -> None:
-        """Test get_records returns empty list on error."""
+    def test_get_records_raises_on_read_error(self) -> None:
+        """Test get_records raises when provider state cannot be read safely."""
         provider = AdGuardDNSProvider(
             url="http://adguard.local", username="admin", password="secret"
         )
@@ -76,9 +77,8 @@ class TestAdGuardGetRecords:
         with patch.object(provider._session, "get") as mock_get:
             mock_get.side_effect = requests.exceptions.RequestException("Network error")
 
-            records = provider.get_records()
-
-            assert records == []
+            with pytest.raises(DNSProviderReadError):
+                provider.get_records()
 
 
 class TestAdGuardAddRecord:
@@ -233,7 +233,7 @@ class TestAdGuardJSONErrorHandling:
     """Tests for AdGuard JSON error handling."""
 
     def test_get_records_handles_malformed_json_response(self) -> None:
-        """Test get_records returns empty list on invalid JSON response."""
+        """Test get_records raises on invalid JSON response."""
         import json
 
         provider = AdGuardDNSProvider(
@@ -246,9 +246,8 @@ class TestAdGuardJSONErrorHandling:
             mock_response.json.side_effect = json.JSONDecodeError("Invalid", "", 0)
             mock_get.return_value = mock_response
 
-            records = provider.get_records()
-
-            assert records == []
+            with pytest.raises(DNSProviderReadError):
+                provider.get_records()
 
     def test_get_records_skips_malformed_records(self) -> None:
         """Test get_records continues parsing valid records when some are malformed."""

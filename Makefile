@@ -14,7 +14,7 @@ IMAGE ?= external-dns:local
 
 .PHONY: help \
 	venv install lint format test test-integration build py-build pre-commit setup \
-	run docker stack stack-dev dev docker-down docker-build start stop restart logs ps \
+	run validate plan docker stack stack-dev dev docker-down docker-build start stop restart logs ps \
 	template templates clean
 
 ## Show this help
@@ -31,7 +31,9 @@ help:
 	@echo "  pre-commit   Install git hooks"
 	@echo ""
 	@echo "Run external-dns:"
-	@echo "  run          Run external-dns locally (Python, requires .env)"
+	@echo "  validate     Validate local config and provider connectivity (no DNS writes)"
+	@echo "  plan         Render local DNS plan against Technitium (no DNS writes)"
+	@echo "  run          Run external-dns locally and reconcile DNS records"
 	@echo ""
 	@echo "Local test stack (AdGuard + Traefik + whoami + external-dns):"
 	@echo "  stack        Build image + start full local test stack (detached)"
@@ -54,7 +56,8 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  make install         # Setup dev environment"
-	@echo "  make run             # Run external-dns locally"
+	@echo "  make plan            # Preview DNS changes locally"
+	@echo "  make run             # Reconcile DNS locally"
 	@echo "  make stack           # Start full local test stack"
 	@echo "  make logs SERVICE=external-dns"
 
@@ -98,9 +101,39 @@ setup: pre-commit
 # Run locally
 # ----------------------
 
+LOCAL_CLI_ARGS ?=
+
+validate: LOCAL_CLI_ARGS := --validate-config
+validate: run
+
+plan: LOCAL_CLI_ARGS := --render-plan
+plan: run
+
 run: venv
-	@set -a; [ -f .env ] && . ./.env; set +a; \
-	$(PYTHON) -m external_dns
+	@set -e; \
+	cleanup() { \
+		ssh -S /tmp/external-dns-nexus-tunnel -O exit nexus >/dev/null 2>&1 || true; \
+		ssh -S /tmp/external-dns-mothership-tunnel -O exit mothership >/dev/null 2>&1 || true; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	ssh -fN -M -S /tmp/external-dns-nexus-tunnel \
+		-L 15380:100.100.1.2:5380 \
+		-L 18080:127.0.0.1:8080 \
+		-o ExitOnForwardFailure=yes \
+		-o BatchMode=yes \
+		-o ConnectTimeout=8 nexus; \
+	ssh -fN -M -S /tmp/external-dns-mothership-tunnel \
+		-L 28080:100.100.1.1:8080 \
+		-o ExitOnForwardFailure=yes \
+		-o BatchMode=yes \
+		-o ConnectTimeout=8 mothership; \
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	unset EXTERNAL_DNS_WEBHOOK_URL EXTERNAL_DNS_WEBHOOK_USERNAME EXTERNAL_DNS_WEBHOOK_PASSWORD \
+		EXTERNAL_DNS_WEBHOOK_METHOD EXTERNAL_DNS_WEBHOOK_TIMEOUT \
+		EXTERNAL_DNS_WEBHOOK_ONLY_ON_CHANGES; \
+	CONFIG_PATH="$${CONFIG_PATH:-$(CURDIR)/docker/config/config.yaml}" \
+	STATE_PATH="$${STATE_PATH:-$(CURDIR)/docker/data/state.json}" \
+	$(PYTHON) -m external_dns.cli $(LOCAL_CLI_ARGS)
 
 
 # ----------------------

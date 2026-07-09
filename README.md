@@ -13,17 +13,17 @@ external-dns automatically discovers hostnames from your reverse proxy configura
 | Provider     | Status    | Environment Prefix |
 | ------------ | --------- | ------------------ |
 | AdGuard Home | Supported | `ADGUARD_`         |
-| Pi-hole      | Planned   | -                  |
-| Technitium   | Planned   | -                  |
-| CoreDNS      | Planned   | -                  |
+| CoreDNS      | Candidate | -                  |
+| Pi-hole      | Candidate | -                  |
+| Technitium   | Supported | `TECHNITIUM_`      |
 
 ### Reverse Proxy Providers
 
 | Provider            | Status    | Environment Prefix |
 | ------------------- | --------- | ------------------ |
+| Caddy               | Candidate | -                  |
+| Nginx Proxy Manager | Candidate | -                  |
 | Traefik             | Supported | `TRAEFIK_`         |
-| Caddy               | Planned   | -                  |
-| Nginx Proxy Manager | Planned   | -                  |
 
 ## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/2699_fe0f/512.gif" width="32" height="32" alt="gear"> Configuration
 
@@ -45,6 +45,66 @@ environment:
   ADGUARD_PASSWORD: '${ADGUARD_ADMIN_PASSWORD}'
 ```
 
+### Technitium DNS Provider
+
+Technitium is a DNS provider only. Traefik remains the reverse proxy source that external-dns reads for route discovery.
+
+Technitium can be selected through environment fallback:
+
+```yaml
+environment:
+  DNS_PROVIDER: technitium
+  TECHNITIUM_URL: 'https://dns.example.com'
+  TECHNITIUM_API_TOKEN: '${TECHNITIUM_API_TOKEN}'
+  TECHNITIUM_ZONES: 'example.com,internal.example.com'
+```
+
+Or through YAML provider entries:
+
+```yaml
+providers:
+  - name: technitium-primary
+    provider: technitium
+    url: 'https://dns-a.example.com'
+    api_token: '${TECHNITIUM_API_TOKEN_PRIMARY}'
+    zones:
+      - example.com
+      - internal.example.com
+```
+
+Technitium configuration fields:
+
+- `provider`: Must be `technitium`
+- `url`: Technitium DNS Server API base URL
+- `api_token`: Technitium API token; external-dns sends it as an `Authorization: Bearer` token
+- `zones`: Explicit authoritative zones to manage; external-dns lists and writes A records only within these configured zones
+
+Treat API tokens as deployment secrets. Do not commit real token values into config files.
+
+Technitium API failures, invalid tokens, malformed JSON, HTTP errors, and missing records are treated as recoverable provider errors. In watch mode, external-dns logs the provider error and continues rather than crashing the process.
+
+### Multiple DNS Write Targets
+
+YAML `providers:` entries are independent DNS write targets. external-dns reconciles each configured provider from that provider's current records, so multiple Technitium instances or mixed AdGuard and Technitium targets can be kept in sync without relying on the first provider's state.
+
+```yaml
+providers:
+  - name: technitium-primary
+    provider: technitium
+    url: 'https://dns-a.example.com'
+    api_token: '${TECHNITIUM_API_TOKEN_PRIMARY}'
+    zones:
+      - example.com
+      - internal.example.com
+  - name: technitium-secondary
+    provider: technitium
+    url: 'https://dns-b.example.com'
+    api_token: '${TECHNITIUM_API_TOKEN_SECONDARY}'
+    zones:
+      - example.com
+      - internal.example.com
+```
+
 ### Traefik Reverse Proxy Provider
 
 **Multi-instance configuration (recommended):**
@@ -63,7 +123,8 @@ Each instance object supports:
 
 - `name` (required): Unique identifier for the instance
 - `url` (required): Traefik API URL
-- `target_ip` (required): IP address to use in DNS records
+- `target_ip` (required): Internal IP address to use for internal DNS records
+- `public_target_ip` (optional): Public IP address to use only for external/public routers from this source
 - `verify_tls` (optional): Verify TLS certificates (default: true)
 - `username` (optional): Basic auth username
 - `password` (optional): Basic auth password
@@ -119,13 +180,12 @@ Zone classification allows you to control which domains are synced to your local
 ```yaml
 environment:
   EXTERNAL_DNS_DEFAULT_ZONE: 'internal' # Default zone for routers (internal or external)
-  EXTERNAL_DNS_ZONE_LABEL: 'external-dns.zone' # Custom label name (optional)
 ```
 
 **Zone Types:**
 
 - `internal`: Create DNS rewrites in local DNS provider (e.g., AdGuard)
-- `external`: Skip local DNS - queries are forwarded to upstream DNS servers
+- `external`: Skip local DNS by default - queries are forwarded to upstream DNS servers
 
 **Zone Detection Priority (first match wins):**
 
@@ -154,6 +214,21 @@ In this setup:
 
 - `myapp.local.example.com` → local DNS rewrite pointing to internal Traefik IP
 - `myapp.example.com` → no local rewrite, resolved via upstream DNS (Cloudflare/Google)
+
+#### Publishing External Routes with a Public IP
+
+External routers are skipped by default to preserve existing local-DNS behavior. To publish external/public routers to configured DNS providers, set `public_target_ip` on the Traefik source that owns those routers:
+
+```yaml
+sources:
+  - name: primary
+    type: traefik
+    url: 'https://traefik.example.com'
+    target_ip: '192.168.1.10'
+    public_target_ip: '${PUBLIC_TARGET_IP}'
+```
+
+With this configuration, internal routers from the source still use `target_ip`, while external routers from the same source are written with `public_target_ip`. The public value is never inferred from `target_ip`; operators must configure it explicitly.
 
 ### Post-Sync Webhooks
 
@@ -227,32 +302,35 @@ services:
 
 Complete list of configuration options:
 
-| Variable                            | Default                | Description                                                     |
-| ----------------------------------- | ---------------------- | --------------------------------------------------------------- |
-| `DNS_PROVIDER`                      | `adguard`              | DNS provider type                                               |
-| `PROXY_PROVIDER`                    | `traefik`              | Reverse proxy type                                              |
-| `ADGUARD_URL`                       | `http://adguard`       | AdGuard Home API URL                                            |
-| `ADGUARD_USERNAME`                  | (empty)                | AdGuard admin username                                          |
-| `ADGUARD_PASSWORD`                  | (empty)                | AdGuard admin password                                          |
-| `CONFIG_PATH`                       | `/config/config.yaml`  | Path to config file                                             |
-| `TRAEFIK_INSTANCES`                 | (empty)                | JSON array of Traefik instances (overrides config file)         |
-| `TRAEFIK_URL`                       | `http://traefik:8080`  | Single-instance Traefik URL (legacy)                            |
-| `TRAEFIK_TARGET_IP`                 | (empty)                | Single-instance target IP (legacy, falls back to `INTERNAL_IP`) |
-| `INTERNAL_IP`                       | (empty)                | Fallback IP for `TRAEFIK_TARGET_IP`                             |
-| `SYNC_MODE`                         | `watch`                | `once` or `watch`                                               |
-| `POLL_INTERVAL_SECONDS`             | `60`                   | Polling interval in watch mode                                  |
-| `LOG_LEVEL`                         | `INFO`                 | `DEBUG`, `INFO`, `WARNING`, `ERROR`                             |
-| `STATE_PATH`                        | `/data/state.json`     | State file location                                             |
-| `EXTERNAL_DNS_STATIC_REWRITES`      | (empty)                | Static DNS rewrites                                             |
-| `EXTERNAL_DNS_EXCLUDE_DOMAINS`      | (empty)                | Domain exclusion patterns                                       |
-| `EXTERNAL_DNS_DEFAULT_ZONE`         | `internal`             | Default zone (`internal`/`external`)                            |
-| `EXTERNAL_DNS_ZONE_LABEL`           | `external-dns.zone`    | Custom zone label name                                          |
-| `EXTERNAL_DNS_WEBHOOK_URL`          | (empty)                | Webhook URL to call after sync                                  |
-| `EXTERNAL_DNS_WEBHOOK_USERNAME`     | (empty)                | Webhook HTTP Basic Auth username                                |
-| `EXTERNAL_DNS_WEBHOOK_PASSWORD`     | (empty)                | Webhook HTTP Basic Auth password                                |
-| `EXTERNAL_DNS_WEBHOOK_METHOD`       | `POST`                 | Webhook HTTP method                                             |
-| `EXTERNAL_DNS_WEBHOOK_TIMEOUT`      | `30`                   | Webhook request timeout (seconds)                               |
-| `EXTERNAL_DNS_WEBHOOK_ONLY_ON_CHANGES` | `true`              | Only call webhook when DNS records change                       |
+| Variable                               | Default               | Description                                                                                           |
+| -------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------- |
+| `DNS_PROVIDER`                         | `adguard`             | DNS provider type                                                                                     |
+| `PROXY_PROVIDER`                       | `traefik`             | Reverse proxy type                                                                                    |
+| `ADGUARD_URL`                          | `http://adguard`      | AdGuard Home API URL                                                                                  |
+| `ADGUARD_USERNAME`                     | (empty)               | AdGuard admin username                                                                                |
+| `ADGUARD_PASSWORD`                     | (empty)               | AdGuard admin password                                                                                |
+| `TECHNITIUM_URL`                       | (empty)               | Technitium DNS Server API URL                                                                         |
+| `TECHNITIUM_API_TOKEN`                 | (empty)               | Technitium API token sent as a bearer token                                                           |
+| `TECHNITIUM_ZONES`                     | (empty)               | Comma-separated authoritative zones for Technitium                                                    |
+| `CONFIG_PATH`                          | `/config/config.yaml` | Path to config file                                                                                   |
+| `TRAEFIK_INSTANCES`                    | (empty)               | JSON array of Traefik instances used when YAML `sources` are not configured                           |
+| `TRAEFIK_URL`                          | `http://traefik:8080` | Single-instance Traefik URL (legacy)                                                                  |
+| `TRAEFIK_TARGET_IP`                    | (empty)               | Single-instance target IP (legacy, falls back to `INTERNAL_IP`)                                       |
+| `INTERNAL_IP`                          | (empty)               | Fallback IP for `TRAEFIK_TARGET_IP`                                                                   |
+| `PUBLIC_TARGET_IP`                     | (empty)               | Example value for YAML `sources[].public_target_ip`; not read directly by legacy single-instance mode |
+| `SYNC_MODE`                            | `watch`               | `once` or `watch`                                                                                     |
+| `POLL_INTERVAL_SECONDS`                | `60`                  | Polling interval in watch mode                                                                        |
+| `LOG_LEVEL`                            | `INFO`                | `DEBUG`, `INFO`, `WARNING`, `ERROR`                                                                   |
+| `STATE_PATH`                           | `/data/state.json`    | State file location                                                                                   |
+| `EXTERNAL_DNS_STATIC_REWRITES`         | (empty)               | Static DNS rewrites                                                                                   |
+| `EXTERNAL_DNS_EXCLUDE_DOMAINS`         | (empty)               | Domain exclusion patterns                                                                             |
+| `EXTERNAL_DNS_DEFAULT_ZONE`            | `internal`            | Default zone (`internal`/`external`)                                                                  |
+| `EXTERNAL_DNS_WEBHOOK_URL`             | (empty)               | Webhook URL to call after sync                                                                        |
+| `EXTERNAL_DNS_WEBHOOK_USERNAME`        | (empty)               | Webhook HTTP Basic Auth username                                                                      |
+| `EXTERNAL_DNS_WEBHOOK_PASSWORD`        | (empty)               | Webhook HTTP Basic Auth password                                                                      |
+| `EXTERNAL_DNS_WEBHOOK_METHOD`          | `POST`                | Webhook HTTP method                                                                                   |
+| `EXTERNAL_DNS_WEBHOOK_TIMEOUT`         | `30`                  | Webhook request timeout (seconds)                                                                     |
+| `EXTERNAL_DNS_WEBHOOK_ONLY_ON_CHANGES` | `true`                | Only call webhook when DNS records change                                                             |
 
 ## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f525/512.gif" width="32" height="32" alt="fire"> Development
 

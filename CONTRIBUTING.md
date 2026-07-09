@@ -31,8 +31,9 @@ make test
 ```
 
 Current coverage areas:
+
 - Sync reconciliation logic (ExternalDNSSyncer)
-- Provider implementations (AdGuard, Traefik)
+- Provider implementations (AdGuard, Technitium, Traefik)
 - State persistence (StateStore)
 - Utility functions (retry logic, domain exclusions)
 
@@ -44,19 +45,23 @@ Run a complete test environment with Traefik + AdGuard Home:
 make docker
 ```
 
-- AdGuard: http://localhost:3000 (admin/password)
-- Traefik: http://localhost:8080
+- AdGuard: <http://localhost:3000> (admin/password)
+- Traefik: <http://localhost:8080>
 
 ## Commit Messages (Required)
 
 This repo enforces Conventional Commits.
 
 Examples:
+
 - `feat(adguard): support custom rewrite ttl`
 - `fix(traefik): handle routers missing rule`
 - `docs: update compose example`
 
 Breaking changes:
+
+Breaking changes:
+
 - Add `!` after the type/scope (e.g., `feat!: change config format`)
 - Or include `BREAKING CHANGE:` in the commit body
 

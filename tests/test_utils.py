@@ -461,10 +461,161 @@ def test_create_dns_provider_error_message_includes_suggestions() -> None:
         # Check that error message includes helpful information
         assert "invalid_provider" in error_message
         assert "adguard" in error_message.lower()  # supported provider
+        assert "technitium" in error_message.lower()  # supported provider
         assert "DNS_PROVIDER" in error_message  # env var hint
     finally:
         # Restore original value
         cli.DNS_PROVIDER = original_value
+
+
+def test_create_dns_providers_loads_multiple_yaml_entries(monkeypatch, tmp_path: Path) -> None:
+    """YAML providers entries create one concrete DNS provider per entry."""
+    from external_dns import cli
+    from external_dns.cli import AdGuardDNSProvider, TechnitiumDNSProvider
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+providers:
+  - name: adguard-home
+    provider: adguard
+    url: http://adguard.local
+    username: admin
+    password: secret
+  - name: authoritative-a
+    provider: technitium
+    url: http://technitium-a.local
+    api_token: token-a
+    zones: [example.com]
+  - name: authoritative-b
+    provider: technitium
+    url: http://technitium-b.local
+    api_token: token-b
+    zones: internal.example.com
+sources:
+  - name: core
+    url: http://traefik.local
+    target_ip: 10.0.0.1
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "CONFIG_PATH", str(config_path))
+
+    providers = cli.create_dns_providers()
+
+    assert len(providers) == 3
+    assert isinstance(providers[0], AdGuardDNSProvider)
+    assert isinstance(providers[1], TechnitiumDNSProvider)
+    assert isinstance(providers[2], TechnitiumDNSProvider)
+    assert providers[1]._url == "http://technitium-a.local"
+    assert providers[2]._zones == ["internal.example.com"]
+
+
+def test_validate_config_reports_each_invalid_yaml_provider(
+    monkeypatch, tmp_path: Path, caplog
+) -> None:
+    """Invalid provider entries report the provider name and provider-specific fields."""
+    from external_dns import cli
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+providers:
+  - name: unsupported-target
+    provider: unsupported
+    url: http://dns.local
+  - name: missing-technitium-fields
+    provider: technitium
+    url: http://technitium.local
+  - name: missing-provider-url
+    provider: technitium
+    api_token: token
+    zones: [example.com]
+sources:
+  - name: core
+    url: http://traefik.local
+    target_ip: 10.0.0.1
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "CONFIG_PATH", str(config_path))
+
+    assert cli.validate_config() is False
+    log_text = caplog.text
+    assert "unsupported-target" in log_text
+    assert "Supported: adguard, technitium" in log_text
+    assert "missing-technitium-fields" in log_text
+    assert "api_token" in log_text
+    assert "zones" in log_text
+    assert "missing-provider-url" in log_text
+    assert "URL is required" in log_text
+
+
+def test_validate_config_does_not_fallback_when_yaml_provider_url_missing(
+    monkeypatch, tmp_path: Path, caplog
+) -> None:
+    """A providers list with invalid entries is validated, not replaced by env fallback."""
+    from external_dns import cli
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+providers:
+  - name: missing-url
+    provider: adguard
+    username: admin
+    password: secret
+sources:
+  - name: core
+    url: http://traefik.local
+    target_ip: 10.0.0.1
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(cli, "ADGUARD_URL", "http://env-adguard.local")
+
+    assert cli.validate_config() is False
+    log_text = caplog.text
+    assert "missing-url" in log_text
+    assert "URL is required" in log_text
+    assert "env-adguard" not in log_text
+
+
+def test_validate_config_does_not_fallback_when_yaml_sources_invalid(
+    monkeypatch, tmp_path: Path, caplog
+) -> None:
+    """Invalid YAML sources are not masked by TRAEFIK_INSTANCES fallback."""
+    from external_dns import cli
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+providers:
+  - name: adguard-home
+    provider: adguard
+    url: http://adguard.local
+    username: admin
+    password: secret
+sources:
+  - name: missing-url
+    target_ip: 10.0.0.1
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(
+        cli,
+        "TRAEFIK_INSTANCES",
+        '[{"name":"env","url":"http://traefik-env:8080","target_ip":"10.0.0.9"}]',
+    )
+
+    assert cli.validate_config() is False
+    log_text = caplog.text
+    assert "missing-url" in log_text
+    assert "url and target_ip are required" in log_text
+    assert "No sources configured" in log_text
+    assert "traefik-env" not in log_text
 
 
 def test_create_proxy_provider_error_message_includes_suggestions() -> None:

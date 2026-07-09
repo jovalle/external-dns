@@ -27,6 +27,7 @@ sources:
   - name: edge
     url: https://traefik2:8080
     target_ip: 10.0.0.3
+    public_target_ip: "  203.0.113.10  "
     verify_tls: false
 """
         )
@@ -38,11 +39,13 @@ sources:
         assert instances[0].name == "core"
         assert instances[0].url == "http://traefik:8080"
         assert instances[0].target_ip == "10.0.0.2"
+        assert instances[0].public_target_ip == ""
         assert instances[0].verify_tls is True
         assert instances[0].router_filter == "*-internal"
         assert instances[1].name == "edge"
         assert instances[1].url == "https://traefik2:8080"
         assert instances[1].target_ip == "10.0.0.3"
+        assert instances[1].public_target_ip == "203.0.113.10"
         assert instances[1].verify_tls is False
 
     def test_get_instances_skips_invalid_entries(self, tmp_path: Path) -> None:
@@ -68,6 +71,28 @@ sources:
         assert len(instances) == 1
         assert instances[0].name == "valid"
 
+    def test_invalid_yaml_sources_do_not_fallback_to_json_env(self, tmp_path: Path) -> None:
+        """A configured YAML sources section takes precedence even when invalid."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+sources:
+  - name: missing_url
+    target_ip: 10.0.0.3
+"""
+        )
+        json_config = json.dumps(
+            [{"name": "env", "url": "http://traefik-env:8080", "target_ip": "10.0.0.9"}]
+        )
+
+        provider = TraefikProxyProvider(
+            config_path=str(config_file),
+            instances_json=json_config,
+        )
+        instances = provider.get_instances()
+
+        assert instances == []
+
 
 class TestTraefikInstanceLoadingFromJson:
     """Tests for Traefik instance loading from JSON environment variable."""
@@ -81,6 +106,7 @@ class TestTraefikInstanceLoadingFromJson:
                     "name": "edge",
                     "url": "https://traefik2:8080",
                     "target_ip": "10.0.0.3",
+                    "public_target_ip": "  203.0.113.20  ",
                     "verify_tls": False,
                 },
             ]
@@ -95,7 +121,9 @@ class TestTraefikInstanceLoadingFromJson:
         assert len(instances) == 2
         assert instances[0].name == "core"
         assert instances[0].url == "http://traefik:8080"
+        assert instances[0].public_target_ip == ""
         assert instances[1].name == "edge"
+        assert instances[1].public_target_ip == "203.0.113.20"
         assert instances[1].verify_tls is False
 
 
@@ -372,6 +400,59 @@ class TestTraefikZoneDetection:
             assert len(routes) == 1
             assert routes[0].zone == DNSZone.EXTERNAL
 
+    def test_external_route_with_public_target_ip_uses_public_answer(self) -> None:
+        """External routes from public-configured sources use explicit public IP."""
+        provider = TraefikProxyProvider(default_zone="internal")
+        instance = ProxyInstance(
+            name="edge",
+            url="http://traefik:8080",
+            target_ip="10.0.0.1",
+            public_target_ip="203.0.113.30",
+        )
+
+        mock_routers = [
+            {"name": "public-app-external@docker", "rule": "Host(`app.example.com`)"},
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert len(routes) == 1
+            assert routes[0].zone == DNSZone.EXTERNAL
+            assert routes[0].target_ip == "203.0.113.30"
+            assert routes[0].publish_external is True
+
+    def test_external_route_without_public_target_ip_keeps_internal_answer(self) -> None:
+        """External routes without public_target_ip keep default skip intent."""
+        provider = TraefikProxyProvider(default_zone="internal")
+        instance = ProxyInstance(
+            name="edge",
+            url="http://traefik:8080",
+            target_ip="10.0.0.1",
+        )
+
+        mock_routers = [
+            {"name": "public-app-external@docker", "rule": "Host(`app.example.com`)"},
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert len(routes) == 1
+            assert routes[0].zone == DNSZone.EXTERNAL
+            assert routes[0].target_ip == "10.0.0.1"
+            assert routes[0].publish_external is False
+
 
 class TestTraefikProviderName:
     """Tests for Traefik provider name property."""
@@ -410,6 +491,12 @@ class TestTraefikHostnameExtraction:
             "Host(`app1.example.com`) || Host(`app2.example.com`)"
         )
         assert sorted(hostnames) == ["app1.example.com", "app2.example.com"]
+
+    def test_extract_hostnames_multiple_args_in_single_host_call(self) -> None:
+        """Test extracting multiple hostnames from one Host() call."""
+        provider = TraefikProxyProvider()
+        hostnames = provider._extract_hostnames("Host(`app1.example.com`, `app2.example.com`)")
+        assert hostnames == ["app1.example.com", "app2.example.com"]
 
     def test_extract_hostnames_empty_rule(self) -> None:
         """Test extracting from empty rule returns empty list."""

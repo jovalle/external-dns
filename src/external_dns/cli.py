@@ -6,6 +6,7 @@ external-dns. Supports multiple DNS providers and reverse proxy implementations.
 
 Supported DNS Providers:
     - adguard: AdGuard Home DNS rewrites
+    - technitium: Technitium DNS Server A records
     (more coming soon)
 
 Supported Reverse Proxy Providers:
@@ -29,6 +30,13 @@ Configuration:
             url: "http://adguard:3000"
             username: "admin"
             password: "secret"
+          - name: technitium-primary
+            provider: technitium
+            url: "https://dns.example.com"
+            api_token: "secret-token"
+            zones:
+              - example.com
+              - internal.example.com
 
         # Sources - reverse proxy instances to discover routes from
         sources:
@@ -44,10 +52,12 @@ Configuration:
 
     DNS Provider Configuration (providers section):
         name            Friendly name for this provider instance
-        provider        Provider type: "adguard" (default)
+        provider        Provider type: "adguard" (default) or "technitium"
         url             Provider API URL (required)
-        username        API username (optional, for basic auth)
-        password        API password (optional, for basic auth)
+        username        API username (optional, adguard basic auth)
+        password        API password (optional, adguard basic auth)
+        api_token       API token (technitium; sent as Authorization: Bearer)
+        zones           Authoritative zones to manage (technitium, required)
 
     Source Configuration (sources section):
         name            Friendly name for this source
@@ -79,18 +89,14 @@ Configuration:
                                   records matching exclusions are cleaned up automatically.
 
     Zone classification:
-        EXTERNAL_DNS_DEFAULT_ZONE     Default zone for routers without explicit zone label.
+        EXTERNAL_DNS_DEFAULT_ZONE     Default zone for routers without explicit suffix.
                                       "internal" (default) or "external".
                                       - internal: Create DNS rewrites in local DNS provider
                                       - external: Skip DNS rewrite (forward to upstream DNS)
 
-        EXTERNAL_DNS_ZONE_LABEL       Label name to check for zone classification.
-                                      Default: "external-dns.zone"
-
         Zone detection priority (first match wins):
           1. Router name suffix: "-internal" or "-external"
-          2. Custom label value (from EXTERNAL_DNS_ZONE_LABEL)
-          3. Default zone (from EXTERNAL_DNS_DEFAULT_ZONE)
+          2. Default zone (from EXTERNAL_DNS_DEFAULT_ZONE)
 
         Example: A service can define multiple routers for different zones:
           traefik.http.routers.myapp-internal.rule: Host(`myapp.local.example.com`)
@@ -109,7 +115,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
@@ -283,6 +289,24 @@ class DNSProviderConfig:
     username: str = ""
     password: str = ""
     api_token: str = ""  # For providers that use API tokens
+    zones: List[str] = field(default_factory=list)
+
+
+def _parse_dns_zones(value: Any) -> List[str]:
+    """Parse DNS zone config from a YAML list or comma-separated string."""
+    if isinstance(value, str):
+        raw_zones = value.split(",")
+    elif isinstance(value, list):
+        raw_zones = value
+    else:
+        raw_zones = []
+
+    zones = []
+    for zone in raw_zones:
+        normalized = str(zone or "").strip().rstrip(".").lower()
+        if normalized:
+            zones.append(normalized)
+    return zones
 
 
 def load_dns_providers_from_yaml(config_path: str) -> List[DNSProviderConfig]:
@@ -322,8 +346,6 @@ def load_dns_providers_from_yaml(config_path: str) -> List[DNSProviderConfig]:
                         provider_type = str(item.get("provider") or "adguard").strip().lower()
                         name = str(item.get("name") or provider_type).strip()
                         url = str(item.get("url") or "").strip()
-                        if not url:
-                            continue
                         providers.append(
                             DNSProviderConfig(
                                 name=name,
@@ -332,6 +354,7 @@ def load_dns_providers_from_yaml(config_path: str) -> List[DNSProviderConfig]:
                                 username=str(item.get("username") or "").strip(),
                                 password=str(item.get("password") or "").strip(),
                                 api_token=str(item.get("api_token") or "").strip(),
+                                zones=_parse_dns_zones(item.get("zones")),
                             )
                         )
 
@@ -358,7 +381,7 @@ def load_dns_providers_from_yaml(config_path: str) -> List[DNSProviderConfig]:
     return providers
 
 
-def load_dns_config_from_yaml(config_path: str) -> Optional[Dict[str, str]]:
+def load_dns_config_from_yaml(config_path: str) -> Optional[Dict[str, Any]]:
     """Load DNS provider configuration from YAML config file.
 
     Looks for 'providers' (new) or 'dns_provider' (legacy) section.
@@ -379,6 +402,9 @@ def load_dns_config_from_yaml(config_path: str) -> Optional[Dict[str, str]]:
         "url": p.url,
         "username": p.username,
         "password": p.password,
+        "api_token": p.api_token,
+        "zones": p.zones,
+        "provider": p.provider,
     }
 
 
@@ -407,6 +433,7 @@ class RuntimeSettings:
     poll_interval: int = 60
     log_level: str = "INFO"
     default_zone: str = "internal"
+    takeover_existing_records: bool = False
     exclude_domains: List[str] = None  # type: ignore
     static_rewrites: Dict[str, str] = None  # type: ignore
     webhook: WebhookConfig = None  # type: ignore
@@ -454,6 +481,10 @@ def load_settings_from_yaml(config_path: str) -> RuntimeSettings:
                     settings.log_level = str(s["log_level"]).strip().upper()
                 if "default_zone" in s:
                     settings.default_zone = str(s["default_zone"]).strip().lower()
+                if "takeover_existing_records" in s:
+                    settings.takeover_existing_records = _parse_bool(
+                        s["takeover_existing_records"], default=False
+                    )
 
             # Load exclude_domains list
             if "exclude_domains" in config_data:
@@ -494,6 +525,11 @@ def load_settings_from_yaml(config_path: str) -> RuntimeSettings:
         settings.log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
     if os.getenv("EXTERNAL_DNS_DEFAULT_ZONE"):
         settings.default_zone = os.getenv("EXTERNAL_DNS_DEFAULT_ZONE", "internal").strip().lower()
+    if os.getenv("EXTERNAL_DNS_TAKEOVER_EXISTING_RECORDS"):
+        settings.takeover_existing_records = _parse_bool(
+            os.getenv("EXTERNAL_DNS_TAKEOVER_EXISTING_RECORDS"),
+            default=False,
+        )
 
     # Merge exclude domains from env var (append to YAML list)
     env_excludes = os.getenv("EXTERNAL_DNS_EXCLUDE_DOMAINS", "").strip()
@@ -548,6 +584,11 @@ ADGUARD_URL = os.getenv("ADGUARD_URL", "")
 ADGUARD_USERNAME = os.getenv("ADGUARD_USERNAME", "")
 ADGUARD_PASSWORD = os.getenv("ADGUARD_PASSWORD", "")
 
+# Technitium configuration (env vars as fallback, YAML config takes priority)
+TECHNITIUM_URL = os.getenv("TECHNITIUM_URL", "")
+TECHNITIUM_API_TOKEN = os.getenv("TECHNITIUM_API_TOKEN", "")
+TECHNITIUM_ZONES = os.getenv("TECHNITIUM_ZONES", "")
+
 # Config file path (supports CONFIG_PATH for backwards compatibility)
 CONFIG_PATH = os.getenv("CONFIG_PATH", os.getenv("CONFIG_PATH", "/config/config.yaml"))
 TRAEFIK_INSTANCES = os.getenv("TRAEFIK_INSTANCES", "").strip()
@@ -566,7 +607,6 @@ EXTERNAL_DNS_EXCLUDE_DOMAINS = os.getenv("EXTERNAL_DNS_EXCLUDE_DOMAINS", "")
 
 # Zone configuration
 EXTERNAL_DNS_DEFAULT_ZONE = os.getenv("EXTERNAL_DNS_DEFAULT_ZONE", "internal").lower().strip()
-EXTERNAL_DNS_ZONE_LABEL = os.getenv("EXTERNAL_DNS_ZONE_LABEL", "external-dns.zone")
 
 # =============================================================================
 # Logging Setup
@@ -632,6 +672,7 @@ class ProxyRoute:
     target_ip: str
     zone: DNSZone = DNSZone.INTERNAL
     router_name: str = ""
+    publish_external: bool = False
 
 
 @dataclass(frozen=True)
@@ -645,6 +686,7 @@ class ProxyInstance:
     verify_tls: bool = True
     username: str = ""
     password: str = ""
+    public_target_ip: str = ""
     router_filter: str = ""
     middleware_filter: str = ""
 
@@ -688,6 +730,10 @@ class DNSProvider(ABC):
         if self.delete_record(domain, old_answer):
             return self.add_record(domain, new_answer)
         return False
+
+
+class DNSProviderReadError(Exception):
+    """Raised when provider records cannot be read safely."""
 
 
 class AdGuardDNSProvider(DNSProvider):
@@ -734,7 +780,7 @@ class AdGuardDNSProvider(DNSProvider):
             if hasattr(e, "response") and e.response is not None:
                 status_info = f" (HTTP {e.response.status_code})"
             logger.error(f"Failed to get records from {self.name} at {self._url}{status_info}: {e}")
-            return []
+            raise DNSProviderReadError(str(e)) from e
 
         records = []
         for r in data:
@@ -785,6 +831,179 @@ class AdGuardDNSProvider(DNSProvider):
             return False
 
 
+class TechnitiumAPIError(Exception):
+    """Recoverable Technitium API status error."""
+
+
+class TechnitiumDNSProvider(DNSProvider):
+    """Technitium DNS Server provider implementation."""
+
+    def __init__(self, url: str, api_token: str, zones: List[str]):
+        self._url = url.rstrip("/")
+        self._zones = _parse_dns_zones(zones)
+        self._session = requests.Session()
+        if api_token:
+            self._session.headers.update({"Authorization": f"Bearer {api_token}"})
+
+    @property
+    def name(self) -> str:
+        return "Technitium DNS Server"
+
+    def _api_get(self, path: str, params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Call a Technitium JSON-status API endpoint."""
+
+        def _do_request() -> Dict[str, Any]:
+            if params is None:
+                response = self._session.get(f"{self._url}{path}", timeout=5)
+            else:
+                response = self._session.get(f"{self._url}{path}", params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise TechnitiumAPIError("malformed response")
+            status = data.get("status")
+            if status != "ok":
+                message = (
+                    data.get("errorMessage") if isinstance(data.get("errorMessage"), str) else ""
+                )
+                detail = f"{status}: {message}" if message else str(status or "missing status")
+                raise TechnitiumAPIError(detail)
+            return data
+
+        return retry_with_backoff(_do_request, max_retries=2, base_delay=1.0)
+
+    def _domain_matches_zone(self, domain: str, zone: str) -> bool:
+        domain_l = domain.rstrip(".").lower()
+        zone_l = zone.rstrip(".").lower()
+        return domain_l == zone_l or domain_l.endswith(f".{zone_l}")
+
+    def _zone_for_domain(self, domain: str) -> Optional[str]:
+        matches = [zone for zone in self._zones if self._domain_matches_zone(domain, zone)]
+        return max(matches, key=len) if matches else None
+
+    def _write_a_record(self, path: str, domain: str, params: Dict[str, str]) -> bool:
+        domain_l = domain.rstrip(".").lower()
+        zone = self._zone_for_domain(domain_l)
+        if not zone:
+            logger.warning(f"No configured Technitium zone matches {domain_l}")
+            return False
+
+        request_params = {
+            "domain": domain_l,
+            "zone": zone,
+            "type": "A",
+            **params,
+        }
+        try:
+            self._api_get(path, params=request_params)
+            return True
+        except (
+            requests.exceptions.RequestException,
+            json.JSONDecodeError,
+            TechnitiumAPIError,
+        ) as e:
+            logger.error(f"Technitium A-record write failed for {domain_l} at {self._url}: {e}")
+            return False
+
+    def test_connection(self) -> bool:
+        try:
+            self._api_get("/api/status")
+            logger.info(f"{self.name} connection successful")
+            return True
+        except (
+            requests.exceptions.RequestException,
+            json.JSONDecodeError,
+            TechnitiumAPIError,
+        ) as e:
+            logger.error(f"Failed to connect to {self.name} at {self._url}: {e}")
+            return False
+
+    def get_records(self) -> List[DNSRecord]:
+        records: List[DNSRecord] = []
+        try:
+            for zone in self._zones:
+                data = self._api_get(
+                    "/api/zones/records/get",
+                    params={"domain": zone, "zone": zone, "listZone": "true"},
+                )
+                response = data.get("response")
+                zone_records = response.get("records") if isinstance(response, dict) else None
+                if not isinstance(zone_records, list):
+                    logger.warning(f"Skipping malformed Technitium zone response for {zone}")
+                    continue
+
+                for record in zone_records:
+                    if not isinstance(record, dict):
+                        logger.warning(f"Skipping malformed Technitium record in {zone}: {record}")
+                        continue
+                    if record.get("disabled") is True or record.get("type") != "A":
+                        continue
+                    domain = record.get("name")
+                    rdata = record.get("rData")
+                    answer = rdata.get("ipAddress") if isinstance(rdata, dict) else None
+                    if not isinstance(domain, str) or not isinstance(answer, str):
+                        logger.warning(
+                            f"Skipping malformed Technitium A record in {zone}: {record}"
+                        )
+                        continue
+                    if not self._domain_matches_zone(domain, zone):
+                        logger.warning(
+                            f"Skipping Technitium record outside configured zone {zone}: {domain}"
+                        )
+                        continue
+                    records.append(
+                        DNSRecord(domain=domain.rstrip(".").lower(), answer=answer.strip())
+                    )
+        except (
+            requests.exceptions.RequestException,
+            json.JSONDecodeError,
+            TechnitiumAPIError,
+        ) as e:
+            logger.error(f"Failed to get records from {self.name} at {self._url}: {e}")
+            raise DNSProviderReadError(str(e)) from e
+
+        return records
+
+    def add_record(self, domain: str, answer: str) -> bool:
+        if not domain or not answer:
+            return False
+        result = self._write_a_record(
+            "/api/zones/records/add",
+            domain,
+            {"ipAddress": answer.strip()},
+        )
+        if result:
+            logger.info(f"Added Technitium A record: {domain} -> {answer}")
+        return result
+
+    def delete_record(self, domain: str, answer: str) -> bool:
+        if not domain or not answer:
+            return False
+        result = self._write_a_record(
+            "/api/zones/records/delete",
+            domain,
+            {"ipAddress": answer.strip()},
+        )
+        if result:
+            logger.info(f"Deleted Technitium A record: {domain} -> {answer}")
+        return result
+
+    def update_record(self, domain: str, old_answer: str, new_answer: str) -> bool:
+        if not domain or not old_answer or not new_answer:
+            return False
+        result = self._write_a_record(
+            "/api/zones/records/update",
+            domain,
+            {
+                "ipAddress": old_answer.strip(),
+                "newIpAddress": new_answer.strip(),
+            },
+        )
+        if result:
+            logger.info(f"Updated Technitium A record: {domain} -> {new_answer}")
+        return result
+
+
 # =============================================================================
 # Reverse Proxy Provider Interface and Implementations
 # =============================================================================
@@ -813,7 +1032,8 @@ class ReverseProxyProvider(ABC):
 class TraefikProxyProvider(ReverseProxyProvider):
     """Traefik reverse proxy provider implementation."""
 
-    HOST_RULE_RE = re.compile(r"Host\([`\"\']([^`\"\']+)[`\"\']\)")
+    HOST_CALL_RE = re.compile(r"Host\(([^)]*)\)")
+    HOST_ARG_RE = re.compile(r"[`\"\']([^`\"\']+)[`\"\']")
     ZONE_SUFFIX_RE = re.compile(r"-(internal|external)(?:@|$)", re.IGNORECASE)
 
     def __init__(
@@ -824,7 +1044,6 @@ class TraefikProxyProvider(ReverseProxyProvider):
         target_ip: str = "",
         timeout_seconds: float = 5.0,
         default_zone: str = "internal",
-        zone_label: str = "external-dns.zone",
     ):
         self._config_path = config_path
         self._instances_json = instances_json
@@ -832,7 +1051,6 @@ class TraefikProxyProvider(ReverseProxyProvider):
         self._target_ip = target_ip
         self._timeout = timeout_seconds
         self._default_zone = DNSZone.INTERNAL if default_zone != "external" else DNSZone.EXTERNAL
-        self._zone_label = zone_label
 
     @property
     def name(self) -> str:
@@ -844,6 +1062,7 @@ class TraefikProxyProvider(ReverseProxyProvider):
             config_files = find_config_files(self._config_path)
             if config_files:
                 all_instances: List[ProxyInstance] = []
+                yaml_sources_configured = False
 
                 for config_file in config_files:
                     try:
@@ -854,6 +1073,7 @@ class TraefikProxyProvider(ReverseProxyProvider):
                             logger.warning(f"Config file {config_file} missing 'sources' key")
                             continue
 
+                        yaml_sources_configured = True
                         for item in config_data["sources"]:
                             if not isinstance(item, dict):
                                 continue
@@ -863,11 +1083,16 @@ class TraefikProxyProvider(ReverseProxyProvider):
                                 item.get("target_ip") or item.get("internal_ip") or ""
                             ).strip()
                             if not url or not target_ip:
+                                logger.error(
+                                    f"Invalid Traefik source '{name}' in {config_file}: "
+                                    "url and target_ip are required"
+                                )
                                 continue
                             instance_type = str(item.get("type") or "traefik").strip()
                             verify_tls = _parse_bool(item.get("verify_tls"), default=True)
                             username = str(item.get("username") or "").strip()
                             password = str(item.get("password") or "").strip()
+                            public_target_ip = str(item.get("public_target_ip") or "").strip()
                             router_filter = str(item.get("router_filter") or "").strip()
                             middleware_filter = str(item.get("middleware_filter") or "").strip()
                             all_instances.append(
@@ -879,6 +1104,7 @@ class TraefikProxyProvider(ReverseProxyProvider):
                                     verify_tls=verify_tls,
                                     username=username,
                                     password=password,
+                                    public_target_ip=public_target_ip,
                                     router_filter=router_filter,
                                     middleware_filter=middleware_filter,
                                 )
@@ -891,6 +1117,8 @@ class TraefikProxyProvider(ReverseProxyProvider):
                         f"Loaded {len(all_instances)} Traefik instance(s) from {len(config_files)} config file(s)"
                     )
                     return all_instances
+                if yaml_sources_configured:
+                    return []
 
         # Fall back to JSON from environment variable
         if self._instances_json:
@@ -912,6 +1140,7 @@ class TraefikProxyProvider(ReverseProxyProvider):
                     verify_tls = _parse_bool(item.get("verify_tls"), default=True)
                     username = str(item.get("username") or "").strip()
                     password = str(item.get("password") or "").strip()
+                    public_target_ip = str(item.get("public_target_ip") or "").strip()
                     router_filter = str(item.get("router_filter") or "").strip()
                     middleware_filter = str(item.get("middleware_filter") or "").strip()
                     instances.append(
@@ -923,6 +1152,7 @@ class TraefikProxyProvider(ReverseProxyProvider):
                             verify_tls=verify_tls,
                             username=username,
                             password=password,
+                            public_target_ip=public_target_ip,
                             router_filter=router_filter,
                             middleware_filter=middleware_filter,
                         )
@@ -996,26 +1226,28 @@ class TraefikProxyProvider(ReverseProxyProvider):
 
             rule = router.get("rule") or ""
             zone = self._detect_zone(router_name, router)
+            publish_external = zone == DNSZone.EXTERNAL and bool(instance.public_target_ip)
+            route_target_ip = instance.public_target_ip if publish_external else instance.target_ip
 
             for hostname in self._extract_hostnames(rule):
                 routes.append(
                     ProxyRoute(
                         hostname=hostname,
                         source_name=instance.name,
-                        target_ip=instance.target_ip,
+                        target_ip=route_target_ip,
                         zone=zone,
                         router_name=router_name,
+                        publish_external=publish_external,
                     )
                 )
         return routes
 
     def _detect_zone(self, router_name: str, router: Dict[str, Any]) -> DNSZone:
-        """Detect DNS zone from router name suffix or labels.
+        """Detect DNS zone from router name suffix or default zone.
 
         Priority:
           1. Router name suffix: -internal or -external
-          2. Custom label (e.g., external-dns.zone)
-          3. Default zone
+          2. Default zone
         """
         # Check router name suffix (e.g., "myapp-internal@docker")
         if router_name:
@@ -1023,11 +1255,6 @@ class TraefikProxyProvider(ReverseProxyProvider):
             if match:
                 zone_str = match.group(1).lower()
                 return DNSZone.EXTERNAL if zone_str == "external" else DNSZone.INTERNAL
-
-        # Check for zone label in middleware or service metadata
-        # Traefik API doesn't expose container labels directly, but we can
-        # check if the router name contains zone hints
-        # For more advanced label detection, consider using Docker API directly
 
         return self._default_zone
 
@@ -1073,7 +1300,13 @@ class TraefikProxyProvider(ReverseProxyProvider):
 
     def _extract_hostnames(self, rule: str) -> List[str]:
         """Extract hostnames from a Traefik router rule."""
-        return sorted({m.group(1) for m in self.HOST_RULE_RE.finditer(rule or "")})
+        hostnames = set()
+        for call in self.HOST_CALL_RE.finditer(rule or ""):
+            for match in self.HOST_ARG_RE.finditer(call.group(1)):
+                hostname = match.group(1).strip()
+                if hostname:
+                    hostnames.add(hostname)
+        return sorted(hostnames)
 
 
 # =============================================================================
@@ -1081,13 +1314,13 @@ class TraefikProxyProvider(ReverseProxyProvider):
 # =============================================================================
 
 
-def get_dns_config() -> Dict[str, str]:
+def get_dns_config() -> Dict[str, Any]:
     """Get DNS provider configuration from YAML config or env vars.
 
     Priority: YAML config > environment variables
 
     Returns:
-        Dict with url, username, password
+        Dict with provider-specific DNS configuration.
     """
     # Try YAML config first
     yaml_config = load_dns_config_from_yaml(CONFIG_PATH)
@@ -1095,25 +1328,75 @@ def get_dns_config() -> Dict[str, str]:
         return yaml_config
 
     # Fall back to environment variables
+    if DNS_PROVIDER == "technitium":
+        return {
+            "provider": "technitium",
+            "url": TECHNITIUM_URL,
+            "username": "",
+            "password": "",
+            "api_token": TECHNITIUM_API_TOKEN,
+            "zones": _parse_dns_zones(TECHNITIUM_ZONES),
+        }
+
     return {
+        "provider": DNS_PROVIDER,
         "url": ADGUARD_URL,
         "username": ADGUARD_USERNAME,
         "password": ADGUARD_PASSWORD,
+        "api_token": "",
+        "zones": [],
     }
 
 
+def _dns_provider_config_from_env() -> DNSProviderConfig:
+    """Build a single DNS provider config from environment fallback variables."""
+    config = get_dns_config()
+    provider_type = str(config.get("provider") or DNS_PROVIDER).lower().strip()
+    return DNSProviderConfig(
+        name=provider_type or "default",
+        provider=provider_type,
+        url=str(config.get("url") or "").strip(),
+        username=str(config.get("username") or "").strip(),
+        password=str(config.get("password") or "").strip(),
+        api_token=str(config.get("api_token") or "").strip(),
+        zones=_parse_dns_zones(config.get("zones")),
+    )
+
+
+def _create_dns_provider_from_config(config: DNSProviderConfig) -> DNSProvider:
+    """Create a concrete DNS provider from normalized config."""
+    provider_type = config.provider.lower().strip()
+    supported = ["adguard", "technitium"]
+
+    if provider_type == "adguard":
+        return AdGuardDNSProvider(config.url, config.username, config.password)
+    if provider_type == "technitium":
+        return TechnitiumDNSProvider(config.url, config.api_token, config.zones)
+    raise ValueError(
+        f"Unsupported DNS provider type '{provider_type}' for provider '{config.name}'. "
+        f"Supported providers: {', '.join(supported)}."
+    )
+
+
+def create_dns_providers() -> List[DNSProvider]:
+    """Factory function to create all configured DNS providers."""
+    yaml_providers = load_dns_providers_from_yaml(CONFIG_PATH)
+    provider_configs = yaml_providers if yaml_providers else [_dns_provider_config_from_env()]
+    return [_create_dns_provider_from_config(config) for config in provider_configs]
+
+
 def create_dns_provider() -> DNSProvider:
-    """Factory function to create the configured DNS provider."""
-    supported = ["adguard"]
-    if DNS_PROVIDER == "adguard":
-        config = get_dns_config()
-        return AdGuardDNSProvider(config["url"], config["username"], config["password"])
-    else:
+    """Factory function to create the first configured DNS provider."""
+    try:
+        return create_dns_providers()[0]
+    except ValueError as e:
+        supported = ["adguard", "technitium"]
+        provider_type = str(get_dns_config().get("provider") or DNS_PROVIDER).lower().strip()
         raise ValueError(
-            f"Unsupported DNS_PROVIDER: '{DNS_PROVIDER}'. "
+            f"Unsupported DNS_PROVIDER: '{provider_type}'. "
             f"Supported providers: {', '.join(supported)}. "
             f"Check your DNS_PROVIDER environment variable."
-        )
+        ) from e
 
 
 def create_proxy_provider(default_zone: Optional[str] = None) -> ReverseProxyProvider:
@@ -1131,7 +1414,6 @@ def create_proxy_provider(default_zone: Optional[str] = None) -> ReverseProxyPro
             url=TRAEFIK_URL,
             target_ip=TRAEFIK_TARGET_IP,
             default_zone=zone,
-            zone_label=EXTERNAL_DNS_ZONE_LABEL,
         )
     else:
         raise ValueError(
@@ -1262,73 +1544,207 @@ class ExternalDNSSyncer:
     def __init__(
         self,
         *,
-        dns_provider: DNSProvider,
+        dns_provider: Optional[DNSProvider] = None,
+        dns_providers: Optional[List[DNSProvider]] = None,
         proxy_provider: ReverseProxyProvider,
         state_store: StateStore,
         static_rewrites: Dict[str, str],
         exclude_patterns: List[re.Pattern],
+        takeover_existing_records: bool = False,
     ):
-        self.dns_provider = dns_provider
+        if dns_providers is not None:
+            providers = list(dns_providers)
+        elif dns_provider is not None:
+            providers = [dns_provider]
+        else:
+            raise ValueError("At least one DNS provider is required")
+        if not providers:
+            raise ValueError("At least one DNS provider is required")
+
+        self.dns_providers = providers
+        self.dns_provider = providers[0]
         self.proxy_provider = proxy_provider
         self.state_store = state_store
         self.static_rewrites = static_rewrites
         self.exclude_patterns = exclude_patterns
+        self.takeover_existing_records = takeover_existing_records
         self._startup_cleanup_done = False
 
-    def _is_record_managed(self, state: Dict[str, Any], domain: str, answer: str) -> bool:
+    def _provider_state_key(self, provider: DNSProvider) -> str:
+        """Return a stable, non-secret provider identity for managed state."""
+        identity = getattr(provider, "_url", "") or getattr(provider, "url", "")
+        if identity:
+            return f"{provider.name}:{identity}"
+        return provider.name
+
+    def _is_record_managed(
+        self,
+        state: Dict[str, Any],
+        domain: str,
+        answer: str,
+        provider: Optional[DNSProvider] = None,
+    ) -> bool:
         """Check if a DNS record was created by external-dns."""
+        dns_provider = provider or self.dns_provider
+        managed_by_provider = state.get("managed_records_by_provider", {})
+        if isinstance(managed_by_provider, dict) and managed_by_provider:
+            provider_key = self._provider_state_key(dns_provider)
+            provider_managed = managed_by_provider.get(provider_key, {})
+            if isinstance(provider_managed, dict):
+                return answer in provider_managed.get(domain, [])
+            return False
+
         managed = state.get("managed_records", {})
         return answer in managed.get(domain, [])
 
-    def _mark_record_managed(self, state: Dict[str, Any], domain: str, answer: str) -> None:
+    def _migrate_legacy_managed_records(self, state: Dict[str, Any]) -> None:
+        """Seed provider-scoped ownership from legacy single-provider state."""
+        legacy_managed = state.get("managed_records", {})
+        managed_by_provider = state.setdefault("managed_records_by_provider", {})
+        if (
+            not isinstance(legacy_managed, dict)
+            or not isinstance(managed_by_provider, dict)
+            or not self.dns_providers
+        ):
+            return
+
+        provider_key = self._provider_state_key(self.dns_providers[0])
+        provider_managed = managed_by_provider.setdefault(provider_key, {})
+        if not isinstance(provider_managed, dict):
+            return
+
+        for domain, answers in legacy_managed.items():
+            if not isinstance(answers, list):
+                continue
+            domain_answers = provider_managed.setdefault(str(domain), [])
+            if not isinstance(domain_answers, list):
+                continue
+            for answer in answers:
+                normalized_answer = str(answer)
+                if normalized_answer and normalized_answer not in domain_answers:
+                    domain_answers.append(normalized_answer)
+
+    def _mark_record_managed(
+        self,
+        state: Dict[str, Any],
+        domain: str,
+        answer: str,
+        provider: Optional[DNSProvider] = None,
+    ) -> None:
         """Track a DNS record as managed by external-dns."""
-        managed = state.setdefault("managed_records", {})
-        domain_answers = managed.setdefault(domain, [])
+        dns_provider = provider or self.dns_provider
+        managed_by_provider = state.setdefault("managed_records_by_provider", {})
+        provider_key = self._provider_state_key(dns_provider)
+        provider_managed = managed_by_provider.setdefault(provider_key, {})
+        provider_answers = provider_managed.setdefault(domain, [])
+        if answer not in provider_answers:
+            provider_answers.append(answer)
+
+        legacy_managed = state.setdefault("managed_records", {})
+        domain_answers = legacy_managed.setdefault(domain, [])
         if answer not in domain_answers:
             domain_answers.append(answer)
 
-    def _unmark_record_managed(self, state: Dict[str, Any], domain: str, answer: str) -> None:
+    def _unmark_record_managed(
+        self,
+        state: Dict[str, Any],
+        domain: str,
+        answer: str,
+        provider: Optional[DNSProvider] = None,
+    ) -> None:
         """Remove a DNS record from managed tracking."""
+        dns_provider = provider or self.dns_provider
+        managed_by_provider = state.get("managed_records_by_provider", {})
+        if isinstance(managed_by_provider, dict):
+            provider_key = self._provider_state_key(dns_provider)
+            provider_managed = managed_by_provider.get(provider_key, {})
+            if isinstance(provider_managed, dict) and domain in provider_managed:
+                if answer in provider_managed[domain]:
+                    provider_managed[domain].remove(answer)
+                if not provider_managed[domain]:
+                    del provider_managed[domain]
+            if isinstance(provider_managed, dict) and not provider_managed:
+                managed_by_provider.pop(provider_key, None)
+
+        answer_still_provider_managed = False
+        if isinstance(managed_by_provider, dict):
+            for provider_managed in managed_by_provider.values():
+                if isinstance(provider_managed, dict) and answer in provider_managed.get(
+                    domain, []
+                ):
+                    answer_still_provider_managed = True
+                    break
+
         managed = state.get("managed_records", {})
-        if domain in managed:
+        if not answer_still_provider_managed and domain in managed:
             if answer in managed[domain]:
                 managed[domain].remove(answer)
             if not managed[domain]:
                 del managed[domain]
 
-    def _sync_static_rewrites(self, state: Dict[str, Any]) -> int:
+    def _sync_static_rewrites_for_provider(
+        self, state: Dict[str, Any], provider: DNSProvider
+    ) -> int:
         """Sync static rewrites and return the number of changes made."""
         if not self.static_rewrites:
             return 0
 
         changes = 0
-        current_records = {r.domain: r.answer for r in self.dns_provider.get_records()}
+        try:
+            current_records = {r.domain: r.answer for r in provider.get_records()}
+        except Exception as e:
+            logger.error(
+                f"[{self._provider_state_key(provider)}] Failed to get DNS records "
+                f"for static rewrites: {e}"
+            )
+            return 0
 
         for domain, answer in self.static_rewrites.items():
             if domain in current_records:
                 current_answer = current_records[domain]
                 if current_answer == answer:
                     # Record already exists with correct answer - mark as managed
-                    self._mark_record_managed(state, domain, answer)
-                elif self._is_record_managed(state, domain, current_answer):
+                    self._mark_record_managed(state, domain, answer, provider)
+                elif self._is_record_managed(state, domain, current_answer, provider):
                     # Record is managed by us with wrong answer - update it
-                    logger.info(f"Updating static rewrite {domain}: {current_answer} -> {answer}")
-                    self.dns_provider.update_record(domain, current_answer, answer)
-                    self._unmark_record_managed(state, domain, current_answer)
-                    self._mark_record_managed(state, domain, answer)
-                    changes += 1
+                    logger.info(
+                        f"[{self._provider_state_key(provider)}] Updating static rewrite "
+                        f"{domain}: {current_answer} -> {answer}"
+                    )
+                    if provider.update_record(domain, current_answer, answer):
+                        self._unmark_record_managed(state, domain, current_answer, provider)
+                        self._mark_record_managed(state, domain, answer, provider)
+                        changes += 1
+                elif self.takeover_existing_records:
+                    logger.info(
+                        f"[{self._provider_state_key(provider)}] Taking ownership of static "
+                        f"rewrite {domain}: {current_answer} -> {answer}"
+                    )
+                    if provider.update_record(domain, current_answer, answer):
+                        self._mark_record_managed(state, domain, answer, provider)
+                        changes += 1
                 else:
                     # Pre-existing record not managed by us - warn and skip
                     logger.warning(
-                        f"Static rewrite {domain} -> {answer} conflicts with pre-existing "
+                        f"[{self._provider_state_key(provider)}] Static rewrite "
+                        f"{domain} -> {answer} conflicts with pre-existing "
                         f"record {domain} -> {current_answer} (not managed by external-dns, skipping)"
                     )
             else:
-                logger.info(f"Adding static rewrite {domain} -> {answer}")
-                self.dns_provider.add_record(domain, answer)
-                self._mark_record_managed(state, domain, answer)
-                changes += 1
+                logger.info(
+                    f"[{self._provider_state_key(provider)}] Adding static rewrite {domain} -> {answer}"
+                )
+                if provider.add_record(domain, answer):
+                    self._mark_record_managed(state, domain, answer, provider)
+                    changes += 1
 
+        return changes
+
+    def _sync_static_rewrites(self, state: Dict[str, Any]) -> int:
+        """Sync static rewrites across all configured DNS providers."""
+        changes = 0
+        for provider in self.dns_providers:
+            changes += self._sync_static_rewrites_for_provider(state, provider)
         return changes
 
     def _cleanup_removed_instances(
@@ -1349,12 +1765,6 @@ class ExternalDNSSyncer:
         changes = 0
         logger.info(f"Detected removed proxy instances: {', '.join(sorted(removed_instances))}")
 
-        # Get current DNS records for cleanup
-        all_records = self.dns_provider.get_records()
-        records_by_domain: Dict[str, List[str]] = {}
-        for r in all_records:
-            records_by_domain.setdefault(r.domain, []).append(r.answer)
-
         # Find and remove domains that were exclusively owned by removed instances
         domains_to_cleanup: List[str] = []
         for domain, domain_state in list(state.get("domains", {}).items()):
@@ -1373,26 +1783,40 @@ class ExternalDNSSyncer:
                 domains_to_cleanup.append(domain)
 
         # Delete DNS records for domains with no remaining sources (only if managed)
-        for domain in sorted(domains_to_cleanup):
-            # Don't remove static rewrites
-            if domain in self.static_rewrites:
-                logger.debug(f"Skipping static rewrite '{domain}' during instance cleanup")
+        for provider in self.dns_providers:
+            records_by_domain: Dict[str, List[str]] = {}
+            try:
+                for r in provider.get_records():
+                    records_by_domain.setdefault(r.domain, []).append(r.answer)
+            except Exception as e:
+                logger.error(
+                    f"[{self._provider_state_key(provider)}] Failed to get DNS records "
+                    f"for removed-instance cleanup: {e}"
+                )
                 continue
 
-            for answer in records_by_domain.get(domain, []):
-                if self._is_record_managed(state, domain, answer):
-                    logger.info(
-                        f"Removing orphaned record from removed instance: {domain} -> {answer}"
-                    )
-                    self.dns_provider.delete_record(domain, answer)
-                    self._unmark_record_managed(state, domain, answer)
-                    changes += 1
-                else:
-                    logger.debug(
-                        f"Skipping pre-existing record during instance cleanup: {domain} -> {answer}"
-                    )
+            for domain in sorted(domains_to_cleanup):
+                # Don't remove static rewrites
+                if domain in self.static_rewrites:
+                    logger.debug(f"Skipping static rewrite '{domain}' during instance cleanup")
+                    continue
 
-            # Remove from state
+                for answer in records_by_domain.get(domain, []):
+                    if self._is_record_managed(state, domain, answer, provider):
+                        logger.info(
+                            f"[{self._provider_state_key(provider)}] Removing orphaned record "
+                            f"from removed instance: {domain} -> {answer}"
+                        )
+                        if provider.delete_record(domain, answer):
+                            self._unmark_record_managed(state, domain, answer, provider)
+                            changes += 1
+                    else:
+                        logger.debug(
+                            f"[{self._provider_state_key(provider)}] Skipping pre-existing "
+                            f"record during instance cleanup: {domain} -> {answer}"
+                        )
+
+        for domain in sorted(domains_to_cleanup):
             state["domains"].pop(domain, None)
 
         # Remove the instance entries from state
@@ -1401,6 +1825,327 @@ class ExternalDNSSyncer:
             logger.info(f"Cleaned up state for removed instance: {removed_name}")
 
         return changes
+
+    def _reconcile_dns_provider(
+        self,
+        provider: DNSProvider,
+        state: Dict[str, Any],
+        desired: Dict[str, str],
+        domains_to_delete_from_state: List[str],
+    ) -> int:
+        """Reconcile desired DNS records against one provider's current records."""
+        provider_key = self._provider_state_key(provider)
+        changes = 0
+        try:
+            all_records = provider.get_records()
+        except Exception as e:
+            logger.error(f"[{provider_key}] Failed to get DNS records for reconciliation: {e}")
+            return 0
+
+        # Build a mapping of domain -> list of answers (to detect duplicates)
+        records_by_domain: Dict[str, List[str]] = {}
+        for r in all_records:
+            records_by_domain.setdefault(r.domain, []).append(r.answer)
+
+        # Clean up existing DNS records that match exclusion patterns (only managed records)
+        if self.exclude_patterns:
+            for domain, answers in list(records_by_domain.items()):
+                # Skip static rewrites
+                if domain in self.static_rewrites:
+                    continue
+                if _is_domain_excluded(domain, self.exclude_patterns):
+                    deleted_any = False
+                    for answer in answers:
+                        if self._is_record_managed(state, domain, answer, provider):
+                            logger.info(
+                                f"[{provider_key}] Removing excluded domain from DNS: "
+                                f"{domain} -> {answer}"
+                            )
+                            if provider.delete_record(domain, answer):
+                                self._unmark_record_managed(state, domain, answer, provider)
+                                changes += 1
+                                deleted_any = True
+                        else:
+                            logger.debug(
+                                f"[{provider_key}] Skipping pre-existing excluded record: "
+                                f"{domain} -> {answer}"
+                            )
+                    # Remove from records_by_domain so we don't process it later
+                    if deleted_any:
+                        del records_by_domain[domain]
+
+        # Apply creates/updates, handling duplicates (respecting managed records).
+        for domain, answer in sorted(desired.items()):
+            existing_answers = records_by_domain.get(domain, [])
+
+            if not existing_answers:
+                # No existing record - add it and mark as managed
+                logger.info(f"[{provider_key}] Adding record {domain} -> {answer}")
+                if provider.add_record(domain, answer):
+                    self._mark_record_managed(state, domain, answer, provider)
+                    changes += 1
+            elif len(existing_answers) == 1 and existing_answers[0] == answer:
+                # Exactly one record with correct answer - adopt it as managed
+                self._mark_record_managed(state, domain, answer, provider)
+            else:
+                # Either wrong answer(s) or duplicates exist
+                # Check which records we can manage
+                managed_answers = [
+                    a
+                    for a in existing_answers
+                    if self._is_record_managed(state, domain, a, provider)
+                ]
+                unmanaged_answers = [
+                    a
+                    for a in existing_answers
+                    if not self._is_record_managed(state, domain, a, provider)
+                ]
+
+                if unmanaged_answers:
+                    # There are pre-existing records we didn't create
+                    if self.takeover_existing_records:
+                        logger.info(
+                            f"[{provider_key}] Taking ownership of pre-existing record(s) "
+                            f"{domain}: {existing_answers} -> {answer}"
+                        )
+                        removed_all = True
+                        for old_answer in existing_answers:
+                            if provider.delete_record(domain, old_answer):
+                                self._unmark_record_managed(state, domain, old_answer, provider)
+                                changes += 1
+                            else:
+                                removed_all = False
+                        if removed_all and provider.add_record(domain, answer):
+                            self._mark_record_managed(state, domain, answer, provider)
+                            changes += 1
+                    elif answer in unmanaged_answers:
+                        # Desired answer already exists as pre-existing - adopt it
+                        logger.debug(
+                            f"[{provider_key}] Adopting pre-existing record {domain} -> {answer}"
+                        )
+                        self._mark_record_managed(state, domain, answer, provider)
+                        # Clean up any managed duplicates
+                        for old_answer in managed_answers:
+                            if old_answer != answer:
+                                logger.info(
+                                    f"[{provider_key}] Removing managed duplicate "
+                                    f"{domain} -> {old_answer}"
+                                )
+                                if provider.delete_record(domain, old_answer):
+                                    self._unmark_record_managed(state, domain, old_answer, provider)
+                                    changes += 1
+                    else:
+                        # Pre-existing record(s) with different answer - warn and skip
+                        logger.warning(
+                            f"[{provider_key}] Domain {domain} has pre-existing record(s) "
+                            f"{unmanaged_answers} (not managed by external-dns); "
+                            f"skipping desired {answer}"
+                        )
+                        # Still clean up our managed records for this domain
+                        for old_answer in managed_answers:
+                            logger.info(
+                                f"[{provider_key}] Removing obsolete managed record "
+                                f"{domain} -> {old_answer}"
+                            )
+                            if provider.delete_record(domain, old_answer):
+                                self._unmark_record_managed(state, domain, old_answer, provider)
+                                changes += 1
+                else:
+                    # All records are managed by us - clean up and recreate
+                    if len(existing_answers) > 1:
+                        logger.warning(
+                            f"[{provider_key}] Found {len(existing_answers)} duplicate records "
+                            f"for {domain}, consolidating"
+                        )
+                    # Delete all existing managed entries
+                    for old_answer in existing_answers:
+                        if provider.delete_record(domain, old_answer):
+                            self._unmark_record_managed(state, domain, old_answer, provider)
+                            changes += 1
+                    # Re-add the single correct record
+                    if provider.add_record(domain, answer):
+                        self._mark_record_managed(state, domain, answer, provider)
+                        changes += 1
+
+        # Apply deletions for domains that now have no sources AND were confirmed absent.
+        for domain in sorted(domains_to_delete_from_state):
+            # Static rewrites are intentionally not auto-removed.
+            if domain in self.static_rewrites:
+                continue
+
+            # Delete only managed records for this domain
+            for old_answer in records_by_domain.get(domain, []):
+                if self._is_record_managed(state, domain, old_answer, provider):
+                    logger.info(f"[{provider_key}] Removing record {domain} -> {old_answer}")
+                    if provider.delete_record(domain, old_answer):
+                        self._unmark_record_managed(state, domain, old_answer, provider)
+                        changes += 1
+                else:
+                    logger.debug(
+                        f"[{provider_key}] Preserving pre-existing record {domain} -> {old_answer}"
+                    )
+
+        return changes
+
+    def render_plan_once(self) -> bool:
+        """Render the desired DNS state without writing provider records or state."""
+        logger.info("Rendering DNS plan (no DNS or state changes will be made)")
+
+        state = self.state_store.load()
+        state.setdefault("version", 1)
+        state.setdefault("instances", {})
+        state.setdefault("domains", {})
+        state.setdefault("managed_records", {})
+        state.setdefault("managed_records_by_provider", {})
+        self._migrate_legacy_managed_records(state)
+
+        instances = self.proxy_provider.get_instances()
+        desired_sources: Dict[str, Dict[str, str]] = {}
+
+        for domain, answer in self.static_rewrites.items():
+            desired_sources.setdefault(domain, {})["static"] = answer
+
+        for instance in instances:
+            try:
+                routes = self.proxy_provider.get_routes(instance)
+            except requests.exceptions.RequestException as e:
+                logger.warning(
+                    f"Proxy instance '{instance.name}' ({instance.url}) unreachable: {e}"
+                )
+                continue
+
+            included_count = 0
+            excluded_count = 0
+            external_count = 0
+            public_external_count = 0
+            for route in routes:
+                hostname = route.hostname
+                if _is_domain_excluded(hostname, self.exclude_patterns):
+                    excluded_count += 1
+                    continue
+                if route.zone == DNSZone.EXTERNAL and not route.publish_external:
+                    external_count += 1
+                    continue
+                if route.zone == DNSZone.EXTERNAL:
+                    public_external_count += 1
+
+                desired_sources.setdefault(hostname, {})[instance.name] = route.target_ip
+                included_count += 1
+
+            stats_parts = []
+            if excluded_count:
+                stats_parts.append(f"{excluded_count} excluded")
+            if external_count:
+                stats_parts.append(f"{external_count} external")
+            if public_external_count:
+                stats_parts.append(f"{public_external_count} public external")
+            stats_msg = f" ({', '.join(stats_parts)})" if stats_parts else ""
+            logger.info(f"Proxy instance '{instance.name}': {included_count} DNS routes{stats_msg}")
+
+        desired: Dict[str, str] = {}
+        configured_order = [i.name for i in instances]
+        for domain, sources in desired_sources.items():
+            if "static" in sources:
+                desired[domain] = sources["static"]
+                continue
+
+            chosen_source = ""
+            for source_name in configured_order:
+                if source_name in sources:
+                    chosen_source = source_name
+                    desired[domain] = sources[source_name]
+                    break
+
+            distinct_answers = sorted({answer for answer in sources.values() if answer})
+            if len(distinct_answers) > 1:
+                logger.warning(
+                    f"Domain '{domain}' present on multiple proxy instances with different "
+                    f"target IPs {distinct_answers}; using '{desired[domain]}' "
+                    f"from '{chosen_source}'"
+                )
+
+        logger.info(f"Desired DNS records: {len(desired)}")
+
+        success = True
+        for provider in self.dns_providers:
+            provider_key = self._provider_state_key(provider)
+            try:
+                all_records = provider.get_records()
+            except Exception as e:
+                logger.error(f"[{provider_key}] Failed to get DNS records for plan: {e}")
+                success = False
+                continue
+
+            records_by_domain: Dict[str, List[str]] = {}
+            for record in all_records:
+                records_by_domain.setdefault(record.domain, []).append(record.answer)
+
+            create_count = 0
+            ok_count = 0
+            update_count = 0
+            conflict_count = 0
+            delete_count = 0
+
+            logger.info(f"[{provider_key}] Plan:")
+            for domain, answer in sorted(desired.items()):
+                existing_answers = records_by_domain.get(domain, [])
+                if not existing_answers:
+                    create_count += 1
+                    logger.info(f"[{provider_key}]   CREATE   {domain} -> {answer}")
+                    continue
+
+                if existing_answers == [answer]:
+                    ok_count += 1
+                    logger.info(f"[{provider_key}]   OK       {domain} -> {answer}")
+                    continue
+
+                if answer in existing_answers:
+                    ok_count += 1
+                    logger.info(
+                        f"[{provider_key}]   OK       {domain} -> {answer} "
+                        f"(existing answers: {existing_answers})"
+                    )
+                    continue
+
+                managed_answers = [
+                    existing
+                    for existing in existing_answers
+                    if self._is_record_managed(state, domain, existing, provider)
+                ]
+                if self.takeover_existing_records:
+                    update_count += 1
+                    logger.info(
+                        f"[{provider_key}]   TAKEOVER {domain}: {existing_answers} -> {answer}"
+                    )
+                    continue
+                if managed_answers and len(managed_answers) == len(existing_answers):
+                    update_count += 1
+                    logger.info(
+                        f"[{provider_key}]   UPDATE   {domain}: {existing_answers} -> {answer}"
+                    )
+                else:
+                    conflict_count += 1
+                    logger.warning(
+                        f"[{provider_key}]   CONFLICT {domain}: existing "
+                        f"{existing_answers}, desired {answer}"
+                    )
+
+            for domain, existing_answers in sorted(records_by_domain.items()):
+                if domain in desired or domain in self.static_rewrites:
+                    continue
+                if _is_domain_excluded(domain, self.exclude_patterns):
+                    continue
+                for existing in existing_answers:
+                    if self._is_record_managed(state, domain, existing, provider):
+                        delete_count += 1
+                        logger.info(f"[{provider_key}]   DELETE   {domain} -> {existing}")
+
+            logger.info(
+                f"[{provider_key}] Summary: {ok_count} ok, {create_count} create, "
+                f"{update_count} update, {delete_count} delete, {conflict_count} conflict"
+            )
+
+        return success
 
     def sync_once(self) -> bool:
         """Run a single sync cycle.
@@ -1415,6 +2160,8 @@ class ExternalDNSSyncer:
         state.setdefault("instances", {})
         state.setdefault("domains", {})
         state.setdefault("managed_records", {})
+        state.setdefault("managed_records_by_provider", {})
+        self._migrate_legacy_managed_records(state)
 
         instances = self.proxy_provider.get_instances()
 
@@ -1436,6 +2183,7 @@ class ExternalDNSSyncer:
                 seen: Set[str] = set()
                 excluded_count = 0
                 external_count = 0
+                public_external_count = 0
                 for route in routes:
                     hostname = route.hostname
                     # Skip domains matching exclusion patterns
@@ -1443,14 +2191,20 @@ class ExternalDNSSyncer:
                         excluded_count += 1
                         logger.debug(f"Excluding domain '{hostname}' (matches exclusion pattern)")
                         continue
-                    # Skip external zone domains (handled by upstream DNS)
-                    if route.zone == DNSZone.EXTERNAL:
+                    # Skip external zone domains unless explicitly mapped to a public answer.
+                    if route.zone == DNSZone.EXTERNAL and not route.publish_external:
                         external_count += 1
                         logger.debug(
                             f"Skipping external zone domain '{hostname}' "
                             f"(router: {route.router_name}, forwarded to upstream DNS)"
                         )
                         continue
+                    if route.zone == DNSZone.EXTERNAL:
+                        public_external_count += 1
+                        logger.debug(
+                            f"Publishing external zone domain '{hostname}' "
+                            f"(router: {route.router_name}) to configured public DNS answer"
+                        )
                     seen.add(hostname)
                     domain_state = state["domains"].setdefault(hostname, {"sources": {}})
                     sources = domain_state.setdefault("sources", {})
@@ -1471,10 +2225,10 @@ class ExternalDNSSyncer:
                     stats_parts.append(f"{excluded_count} excluded")
                 if external_count:
                     stats_parts.append(f"{external_count} external")
+                if public_external_count:
+                    stats_parts.append(f"{public_external_count} public external")
                 stats_msg = f" ({', '.join(stats_parts)})" if stats_parts else ""
-                logger.info(
-                    f"Proxy instance '{instance.name}': {len(seen)} internal domains{stats_msg}"
-                )
+                logger.info(f"Proxy instance '{instance.name}': {len(seen)} DNS domains{stats_msg}")
 
             except requests.exceptions.RequestException as e:
                 instance_success[instance.name] = False
@@ -1544,120 +2298,24 @@ class ExternalDNSSyncer:
 
             desired[domain] = chosen_answer
 
-        all_records = self.dns_provider.get_records()
+        for provider in self.dns_providers:
+            changes_made += self._reconcile_dns_provider(
+                provider,
+                state,
+                desired,
+                domains_to_delete_from_state,
+            )
 
-        # Build a mapping of domain -> list of answers (to detect duplicates)
-        records_by_domain: Dict[str, List[str]] = {}
-        for r in all_records:
-            records_by_domain.setdefault(r.domain, []).append(r.answer)
-
-        # Clean up existing DNS records that match exclusion patterns (only managed records)
-        if self.exclude_patterns:
-            for domain, answers in list(records_by_domain.items()):
-                # Skip static rewrites
-                if domain in self.static_rewrites:
-                    continue
-                if _is_domain_excluded(domain, self.exclude_patterns):
-                    deleted_any = False
-                    for answer in answers:
-                        if self._is_record_managed(state, domain, answer):
-                            logger.info(f"Removing excluded domain from DNS: {domain} -> {answer}")
-                            self.dns_provider.delete_record(domain, answer)
-                            self._unmark_record_managed(state, domain, answer)
-                            changes_made += 1
-                            deleted_any = True
-                        else:
-                            logger.debug(
-                                f"Skipping pre-existing excluded record: {domain} -> {answer}"
-                            )
-                    # Also remove from state if present
-                    state["domains"].pop(domain, None)
-                    # Remove from records_by_domain so we don't process it later
-                    if deleted_any:
-                        del records_by_domain[domain]
-
-        # Apply creates/updates, handling duplicates (respecting managed records).
-        for domain, answer in sorted(desired.items()):
-            existing_answers = records_by_domain.get(domain, [])
-
-            if not existing_answers:
-                # No existing record - add it and mark as managed
-                logger.info(f"Adding record {domain} -> {answer}")
-                self.dns_provider.add_record(domain, answer)
-                self._mark_record_managed(state, domain, answer)
-                changes_made += 1
-            elif len(existing_answers) == 1 and existing_answers[0] == answer:
-                # Exactly one record with correct answer - adopt it as managed
-                self._mark_record_managed(state, domain, answer)
-            else:
-                # Either wrong answer(s) or duplicates exist
-                # Check which records we can manage
-                managed_answers = [
-                    a for a in existing_answers if self._is_record_managed(state, domain, a)
-                ]
-                unmanaged_answers = [
-                    a for a in existing_answers if not self._is_record_managed(state, domain, a)
-                ]
-
-                if unmanaged_answers:
-                    # There are pre-existing records we didn't create
-                    if answer in unmanaged_answers:
-                        # Desired answer already exists as pre-existing - adopt it
-                        logger.debug(f"Adopting pre-existing record {domain} -> {answer}")
-                        self._mark_record_managed(state, domain, answer)
-                        # Clean up any managed duplicates
-                        for old_answer in managed_answers:
-                            if old_answer != answer:
-                                logger.info(f"Removing managed duplicate {domain} -> {old_answer}")
-                                self.dns_provider.delete_record(domain, old_answer)
-                                self._unmark_record_managed(state, domain, old_answer)
-                                changes_made += 1
-                    else:
-                        # Pre-existing record(s) with different answer - warn and skip
-                        logger.warning(
-                            f"Domain {domain} has pre-existing record(s) {unmanaged_answers} "
-                            f"(not managed by external-dns); skipping desired {answer}"
-                        )
-                        # Still clean up our managed records for this domain
-                        for old_answer in managed_answers:
-                            logger.info(
-                                f"Removing obsolete managed record {domain} -> {old_answer}"
-                            )
-                            self.dns_provider.delete_record(domain, old_answer)
-                            self._unmark_record_managed(state, domain, old_answer)
-                            changes_made += 1
-                else:
-                    # All records are managed by us - clean up and recreate
-                    if len(existing_answers) > 1:
-                        logger.warning(
-                            f"Found {len(existing_answers)} duplicate records for {domain}, consolidating"
-                        )
-                    # Delete all existing managed entries
-                    for old_answer in existing_answers:
-                        self.dns_provider.delete_record(domain, old_answer)
-                        self._unmark_record_managed(state, domain, old_answer)
-                        changes_made += 1
-                    # Re-add the single correct record
-                    self.dns_provider.add_record(domain, answer)
-                    self._mark_record_managed(state, domain, answer)
-                    changes_made += 1
-
-        # Apply deletions for domains that now have no sources AND were confirmed absent.
         for domain in sorted(domains_to_delete_from_state):
-            # Static rewrites are intentionally not auto-removed.
-            if domain in self.static_rewrites:
-                continue
+            if domain not in self.static_rewrites:
+                state["domains"].pop(domain, None)
 
-            # Delete only managed records for this domain
-            for old_answer in records_by_domain.get(domain, []):
-                if self._is_record_managed(state, domain, old_answer):
-                    logger.info(f"Removing record {domain} -> {old_answer}")
-                    self.dns_provider.delete_record(domain, old_answer)
-                    self._unmark_record_managed(state, domain, old_answer)
-                    changes_made += 1
-                else:
-                    logger.debug(f"Preserving pre-existing record {domain} -> {old_answer}")
-            state["domains"].pop(domain, None)
+        if self.exclude_patterns:
+            for domain in list(state["domains"].keys()):
+                if domain not in self.static_rewrites and _is_domain_excluded(
+                    domain, self.exclude_patterns
+                ):
+                    state["domains"].pop(domain, None)
 
         self.state_store.save(state)
 
@@ -1665,6 +2323,41 @@ class ExternalDNSSyncer:
             logger.info(f"Sync completed with {changes_made} DNS record change(s)")
 
         return changes_made > 0
+
+
+def _build_static_rewrites(
+    settings: RuntimeSettings, instances: List[ProxyInstance]
+) -> Dict[str, str]:
+    """Build static rewrite answers, using the first source target as default."""
+    default_ip_for_static = instances[0].target_ip if instances else ""
+    static_rewrites: Dict[str, str] = {}
+    for domain, answer in settings.static_rewrites.items():
+        if answer:
+            static_rewrites[domain] = answer
+        elif default_ip_for_static:
+            static_rewrites[domain] = default_ip_for_static
+    return static_rewrites
+
+
+def _apply_runtime_config_to_syncer(
+    syncer: ExternalDNSSyncer,
+    *,
+    dns_providers: List[DNSProvider],
+    proxy_provider: ReverseProxyProvider,
+    settings: RuntimeSettings,
+    instances: List[ProxyInstance],
+) -> None:
+    """Apply reloaded runtime inputs and force removed-source cleanup next sync."""
+    if not dns_providers:
+        raise ValueError("At least one DNS provider is required")
+
+    syncer.dns_providers = list(dns_providers)
+    syncer.dns_provider = dns_providers[0]
+    syncer.proxy_provider = proxy_provider
+    syncer.static_rewrites = _build_static_rewrites(settings, instances)
+    syncer.exclude_patterns = _parse_exclude_patterns(settings.exclude_domains)
+    syncer.takeover_existing_records = settings.takeover_existing_records
+    syncer._startup_cleanup_done = False
 
 
 # =============================================================================
@@ -1686,30 +2379,51 @@ def validate_config() -> bool:
     using_yaml_config = len(yaml_providers) > 0
 
     # Validate DNS provider config
-    dns_config = get_dns_config()
-    if not dns_config["url"]:
-        if using_yaml_config:
-            errors.append(
-                f"No DNS provider URL found in config file. "
-                f"Check 'providers' or 'dns_provider' section in {CONFIG_PATH}"
-            )
-        else:
-            errors.append(
-                "DNS provider URL is required. "
-                "Set via YAML config (providers[].url) or ADGUARD_URL env var."
-            )
-    else:
-        # Determine provider type from YAML or env
-        provider_type = "adguard"
-        if yaml_providers:
-            provider_type = yaml_providers[0].provider
+    provider_configs = yaml_providers if using_yaml_config else [_dns_provider_config_from_env()]
+    for provider_config in provider_configs:
+        provider_type = provider_config.provider.lower().strip()
+        provider_label = provider_config.name or provider_type or "default"
 
-        if provider_type not in ["adguard"]:
-            errors.append(f"Unsupported DNS provider type: {provider_type}. Supported: adguard")
-        elif not dns_config["username"] or not dns_config["password"]:
+        if provider_type not in ["adguard", "technitium"]:
+            errors.append(
+                f"DNS provider '{provider_label}' has unsupported provider type: "
+                f"{provider_type}. Supported: adguard, technitium"
+            )
+            continue
+
+        if not provider_config.url:
+            if using_yaml_config:
+                errors.append(
+                    f"DNS provider '{provider_label}' URL is required. "
+                    f"Set providers[].url in {CONFIG_PATH}."
+                )
+            elif provider_type == "technitium":
+                errors.append(
+                    "Technitium URL is required. "
+                    "Set via YAML config (providers[].url) or TECHNITIUM_URL env var."
+                )
+            else:
+                errors.append(
+                    "DNS provider URL is required. "
+                    "Set via YAML config (providers[].url) or ADGUARD_URL env var."
+                )
+            continue
+
+        if provider_type == "technitium":
+            if not provider_config.api_token:
+                errors.append(
+                    f"DNS provider '{provider_label}' Technitium api_token is required. "
+                    "Set via YAML config (providers[].api_token) or TECHNITIUM_API_TOKEN env var."
+                )
+            if not provider_config.zones:
+                errors.append(
+                    f"DNS provider '{provider_label}' Technitium zones are required. "
+                    "Set via YAML config (providers[].zones) or TECHNITIUM_ZONES env var."
+                )
+        elif not provider_config.username or not provider_config.password:
             if using_yaml_config:
                 logger.warning(
-                    "⚠️  DNS provider username/password not set in config. "
+                    f"⚠️  DNS provider '{provider_label}' username/password not set in config. "
                     "Using unauthenticated access."
                 )
             else:
@@ -1757,23 +2471,64 @@ def main():
 
     logger.info(f"external-dns: {PROXY_PROVIDER} -> {DNS_PROVIDER}")
 
+    if "--validate-config" in sys.argv:
+        if not validate_config():
+            logger.error("Configuration validation failed")
+            sys.exit(1)
+
+        dns_provider_configs = load_dns_providers_from_yaml(CONFIG_PATH)
+        if not dns_provider_configs:
+            dns_provider_configs = [_dns_provider_config_from_env()]
+        dns_providers = create_dns_providers()
+        proxy_provider = create_proxy_provider(default_zone=settings.default_zone)
+        instances = proxy_provider.get_instances()
+
+        logger.info(f"Configured {len(dns_providers)} DNS provider(s):")
+        for config, provider in zip(dns_provider_configs, dns_providers, strict=True):
+            logger.info(f"  - {config.name}: {provider.name} ({config.url})")
+        logger.info(f"Configured {len(instances)} proxy instance(s):")
+        for inst in instances:
+            logger.info(f"  - {inst.name}: {inst.url} -> {inst.target_ip}")
+        logger.info(
+            "Takeover existing records: "
+            f"{'enabled' if settings.takeover_existing_records else 'disabled'}"
+        )
+
+        failed_providers = [
+            provider.name for provider in dns_providers if not provider.test_connection()
+        ]
+        if failed_providers:
+            logger.error(f"DNS provider connection failed: {', '.join(failed_providers)}")
+            sys.exit(1)
+
+        logger.info("Configuration validation successful")
+        return
+
     # Validate configuration
     if not validate_config():
         logger.error("Configuration validation failed")
         sys.exit(1)
 
     # Create providers
-    dns_config = get_dns_config()
-    dns_provider = create_dns_provider()
+    dns_provider_configs = load_dns_providers_from_yaml(CONFIG_PATH)
+    if not dns_provider_configs:
+        dns_provider_configs = [_dns_provider_config_from_env()]
+    dns_providers = create_dns_providers()
     proxy_provider = create_proxy_provider(default_zone=settings.default_zone)
     instances = proxy_provider.get_instances()
 
-    logger.info(f"DNS Provider: {dns_provider.name} ({dns_config['url']})")
+    logger.info(f"Configured {len(dns_providers)} DNS provider(s):")
+    for config, provider in zip(dns_provider_configs, dns_providers, strict=True):
+        logger.info(f"  - {config.name}: {provider.name} ({config.url})")
     logger.info(f"Proxy Provider: {proxy_provider.name}")
     logger.info(f"Configured {len(instances)} proxy instance(s):")
     for inst in instances:
         logger.info(f"  - {inst.name}: {inst.url} -> {inst.target_ip}")
     logger.info(f"Default zone: {settings.default_zone} (only 'internal' zones sync to local DNS)")
+    logger.info(
+        "Takeover existing records: "
+        f"{'enabled' if settings.takeover_existing_records else 'disabled'}"
+    )
     logger.info(f"Sync mode: {settings.sync_mode}")
     if settings.sync_mode == "watch":
         logger.info(f"Poll interval: {settings.poll_interval}s")
@@ -1783,16 +2538,8 @@ def main():
         else:
             logger.info(f"Config watch: enabled for {CONFIG_PATH}")
 
-    # Best-effort default IP for static rewrites (use first instance target_ip).
-    default_ip_for_static = instances[0].target_ip if instances else ""
-
     # Process static rewrites from settings (fill in default IP for entries without one)
-    static_rewrites: Dict[str, str] = {}
-    for domain, answer in settings.static_rewrites.items():
-        if answer:
-            static_rewrites[domain] = answer
-        elif default_ip_for_static:
-            static_rewrites[domain] = default_ip_for_static
+    static_rewrites = _build_static_rewrites(settings, instances)
     if static_rewrites:
         logger.info(f"Static rewrites: {', '.join(sorted(static_rewrites.keys()))}")
 
@@ -1809,18 +2556,33 @@ def main():
         else:
             logger.info("  - Triggered on every sync cycle")
 
-    # Test connection
-    if not dns_provider.test_connection():
-        logger.error(f"Cannot connect to {dns_provider.name}. Exiting.")
+    # Test connections. Continue when at least one DNS provider is reachable so
+    # temporarily failed targets can recover in watch mode.
+    successful_dns_connections = 0
+    for provider in dns_providers:
+        if provider.test_connection():
+            successful_dns_connections += 1
+        else:
+            logger.warning(
+                f"Cannot connect to {provider.name}; sync will continue for other providers."
+            )
+    if successful_dns_connections == 0:
+        logger.error("Cannot connect to any configured DNS provider. Exiting.")
         sys.exit(1)
 
     syncer = ExternalDNSSyncer(
-        dns_provider=dns_provider,
+        dns_providers=dns_providers,
         proxy_provider=proxy_provider,
         state_store=StateStore(STATE_PATH),
         static_rewrites=static_rewrites,
         exclude_patterns=exclude_patterns,
+        takeover_existing_records=settings.takeover_existing_records,
     )
+
+    if "--render-plan" in sys.argv:
+        if not syncer.render_plan_once():
+            sys.exit(1)
+        return
 
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -1920,18 +2682,41 @@ def main():
                 config_files = current_config_files
                 last_config_mtimes = current_mtimes
 
-                # Recreate proxy provider with new config
+                # Recreate providers with new config
                 try:
                     # Reload settings for any changes
                     settings = load_settings_from_yaml(CONFIG_PATH)
+                    dns_provider_configs = load_dns_providers_from_yaml(CONFIG_PATH)
+                    if not dns_provider_configs:
+                        dns_provider_configs = [_dns_provider_config_from_env()]
+                    dns_providers = create_dns_providers()
+                    successful_dns_connections = 0
+                    for provider in dns_providers:
+                        if provider.test_connection():
+                            successful_dns_connections += 1
+                        else:
+                            logger.warning(
+                                f"Cannot connect to {provider.name}; "
+                                "sync will continue for other providers."
+                            )
+                    if successful_dns_connections == 0:
+                        raise RuntimeError("Cannot connect to any configured DNS provider")
+
                     proxy_provider = create_proxy_provider(default_zone=settings.default_zone)
                     instances = proxy_provider.get_instances()
                     logger.info(
-                        f"Reloaded {len(instances)} instance(s): {', '.join([i.name for i in instances])}"
+                        f"Reloaded {len(instances)} instance(s): "
+                        f"{', '.join([i.name for i in instances])}"
                     )
 
-                    # Update syncer with new provider
-                    syncer.proxy_provider = proxy_provider
+                    # Update syncer with all reloaded runtime inputs.
+                    _apply_runtime_config_to_syncer(
+                        syncer,
+                        dns_providers=dns_providers,
+                        proxy_provider=proxy_provider,
+                        settings=settings,
+                        instances=instances,
+                    )
 
                     # Trigger immediate sync after config reload
                     logger.info("Triggering immediate sync after config reload")

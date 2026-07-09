@@ -10,13 +10,16 @@ from typing import Dict, List, Set
 
 from external_dns.cli import (
     DNSProvider,
+    DNSProviderReadError,
     DNSRecord,
     DNSZone,
     ExternalDNSSyncer,
     ProxyInstance,
     ProxyRoute,
     ReverseProxyProvider,
+    RuntimeSettings,
     StateStore,
+    _apply_runtime_config_to_syncer,
 )
 
 # =============================================================================
@@ -27,8 +30,15 @@ from external_dns.cli import (
 class MockDNSProvider(DNSProvider):
     """Mock DNS provider with in-memory record storage and call tracking."""
 
-    def __init__(self, initial_records: List[DNSRecord] | None = None):
+    def __init__(
+        self,
+        initial_records: List[DNSRecord] | None = None,
+        *,
+        name: str = "MockDNS",
+    ):
         self._records: Dict[str, str] = {}
+        self._name = name
+        self._url = f"mock://{name}"
         self.add_calls: List[tuple[str, str]] = []
         self.delete_calls: List[tuple[str, str]] = []
         self.update_calls: List[tuple[str, str, str]] = []
@@ -39,7 +49,7 @@ class MockDNSProvider(DNSProvider):
 
     @property
     def name(self) -> str:
-        return "MockDNS"
+        return self._name
 
     def test_connection(self) -> bool:
         return True
@@ -113,6 +123,7 @@ def create_test_syncer(
     static_rewrites: Dict[str, str] | None = None,
     exclude_patterns: List[re.Pattern] | None = None,
     failing_instances: Set[str] | None = None,
+    takeover_existing_records: bool = False,
 ) -> tuple[ExternalDNSSyncer, MockDNSProvider, MockProxyProvider]:
     """Create a test syncer with mocked providers.
 
@@ -132,9 +143,37 @@ def create_test_syncer(
         state_store=state_store,
         static_rewrites=static_rewrites or {},
         exclude_patterns=exclude_patterns or [],
+        takeover_existing_records=takeover_existing_records,
     )
 
     return syncer, dns_provider, proxy_provider
+
+
+def create_test_syncer_with_dns_providers(
+    tmp_path: Path,
+    dns_providers: List[MockDNSProvider],
+    proxy_instances: List[ProxyInstance] | None = None,
+    proxy_routes: Dict[str, List[ProxyRoute]] | None = None,
+    static_rewrites: Dict[str, str] | None = None,
+    exclude_patterns: List[re.Pattern] | None = None,
+    failing_instances: Set[str] | None = None,
+    takeover_existing_records: bool = False,
+) -> tuple[ExternalDNSSyncer, MockProxyProvider]:
+    """Create a syncer with multiple DNS providers."""
+    proxy_provider = MockProxyProvider(
+        instances=proxy_instances or [],
+        routes_by_instance=proxy_routes or {},
+        failing_instances=failing_instances,
+    )
+    syncer = ExternalDNSSyncer(
+        dns_providers=dns_providers,
+        proxy_provider=proxy_provider,
+        state_store=StateStore(str(tmp_path / "state.json")),
+        static_rewrites=static_rewrites or {},
+        exclude_patterns=exclude_patterns or [],
+        takeover_existing_records=takeover_existing_records,
+    )
+    return syncer, proxy_provider
 
 
 def make_instance(name: str, target_ip: str = "10.0.0.1") -> ProxyInstance:
@@ -147,6 +186,7 @@ def make_route(
     target_ip: str = "10.0.0.1",
     zone: DNSZone = DNSZone.INTERNAL,
     source_name: str = "router1",
+    publish_external: bool = False,
 ) -> ProxyRoute:
     """Create a ProxyRoute for testing."""
     return ProxyRoute(
@@ -155,6 +195,7 @@ def make_route(
         target_ip=target_ip,
         zone=zone,
         router_name=source_name,
+        publish_external=publish_external,
     )
 
 
@@ -175,6 +216,26 @@ def test_sync_adds_new_record_when_route_discovered(tmp_path: Path) -> None:
     assert ("app.example.com", "10.0.0.1") in dns.add_calls
     records = {r.domain: r.answer for r in dns.get_records()}
     assert records.get("app.example.com") == "10.0.0.1"
+
+
+def test_render_plan_does_not_write_records(tmp_path: Path, caplog) -> None:
+    """Render plan previews desired DNS changes without mutating DNS or state."""
+    instances = [make_instance("core")]
+    routes = {"core": [make_route("app.example.com", "10.0.0.1")]}
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+
+    caplog.set_level("INFO")
+
+    assert syncer.render_plan_once() is True
+
+    assert dns.add_calls == []
+    assert dns.delete_calls == []
+    assert not (tmp_path / "state.json").exists()
+    assert "CREATE   app.example.com -> 10.0.0.1" in caplog.text
 
 
 def test_sync_removes_record_when_route_removed(tmp_path: Path) -> None:
@@ -472,6 +533,54 @@ def test_sync_skips_external_zone_domains(tmp_path: Path) -> None:
     assert "external.example.com" not in records
 
 
+def test_external_route_uses_public_target_ip(tmp_path: Path) -> None:
+    """Explicitly published external routes should be added with their public IP."""
+    instances = [make_instance("edge", "10.0.0.1")]
+    routes = {
+        "edge": [
+            make_route(
+                "app.example.com",
+                "203.0.113.40",
+                zone=DNSZone.EXTERNAL,
+                source_name="edge",
+                publish_external=True,
+            ),
+        ]
+    }
+
+    syncer, dns, _ = create_test_syncer(tmp_path, proxy_instances=instances, proxy_routes=routes)
+
+    syncer.sync_once()
+
+    assert ("app.example.com", "203.0.113.40") in dns.add_calls
+    records = {r.domain: r.answer for r in dns.get_records()}
+    assert records.get("app.example.com") == "203.0.113.40"
+
+
+def test_sync_source_order_applies_to_public_external_conflicts(tmp_path: Path) -> None:
+    """Configured source order should still choose the DNS answer for public routes."""
+    instances = [make_instance("edge", "10.0.0.1"), make_instance("core", "10.0.0.2")]
+    routes = {
+        "edge": [
+            make_route(
+                "app.example.com",
+                "203.0.113.50",
+                zone=DNSZone.EXTERNAL,
+                source_name="edge",
+                publish_external=True,
+            ),
+        ],
+        "core": [make_route("app.example.com", "10.0.0.2", source_name="core")],
+    }
+
+    syncer, dns, _ = create_test_syncer(tmp_path, proxy_instances=instances, proxy_routes=routes)
+
+    syncer.sync_once()
+
+    records = {r.domain: r.answer for r in dns.get_records()}
+    assert records.get("app.example.com") == "203.0.113.50"
+
+
 def test_sync_only_syncs_internal_zone_domains(tmp_path: Path) -> None:
     """Mix of zones should only sync internal zones."""
     instances = [make_instance("core")]
@@ -709,6 +818,146 @@ def test_sync_handles_multiple_domains_from_single_instance(tmp_path: Path) -> N
 
 
 # =============================================================================
+# Multi-DNS Provider Scenarios
+# =============================================================================
+
+
+def test_sync_reconciles_each_dns_provider(tmp_path: Path) -> None:
+    """Each DNS provider reconciles against its own current records."""
+    primary = MockDNSProvider(
+        [DNSRecord("app.example.com", "10.0.0.1")],
+        name="primary",
+    )
+    secondary = MockDNSProvider(name="secondary")
+    instances = [make_instance("core", "10.0.0.1")]
+    routes = {"core": [make_route("app.example.com", "10.0.0.1")]}
+
+    syncer, _ = create_test_syncer_with_dns_providers(
+        tmp_path,
+        [primary, secondary],
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+
+    syncer.sync_once()
+
+    assert primary.add_calls == []
+    assert ("app.example.com", "10.0.0.1") in secondary.add_calls
+    assert {r.domain: r.answer for r in primary.get_records()}["app.example.com"] == "10.0.0.1"
+    assert {r.domain: r.answer for r in secondary.get_records()}["app.example.com"] == "10.0.0.1"
+
+
+def test_sync_updates_each_dns_provider_from_its_own_records(tmp_path: Path) -> None:
+    """Managed updates are decided from each provider's existing answer."""
+    primary = MockDNSProvider(
+        [DNSRecord("app.example.com", "10.0.0.9")],
+        name="primary",
+    )
+    secondary = MockDNSProvider(
+        [DNSRecord("app.example.com", "10.0.0.8")],
+        name="secondary",
+    )
+    instances = [make_instance("core", "10.0.0.1")]
+    routes = {"core": [make_route("app.example.com", "10.0.0.1")]}
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {},
+            "domains": {},
+            "managed_records_by_provider": {
+                "primary:mock://primary": {"app.example.com": ["10.0.0.9"]},
+                "secondary:mock://secondary": {"app.example.com": ["10.0.0.8"]},
+            },
+        }
+    )
+    proxy_provider = MockProxyProvider(instances=instances, routes_by_instance=routes)
+    syncer = ExternalDNSSyncer(
+        dns_providers=[primary, secondary],
+        proxy_provider=proxy_provider,
+        state_store=state_store,
+        static_rewrites={},
+        exclude_patterns=[],
+    )
+
+    syncer.sync_once()
+
+    assert ("app.example.com", "10.0.0.9") in primary.delete_calls
+    assert ("app.example.com", "10.0.0.8") in secondary.delete_calls
+    assert ("app.example.com", "10.0.0.1") in primary.add_calls
+    assert ("app.example.com", "10.0.0.1") in secondary.add_calls
+
+
+def test_sync_static_rewrites_apply_to_each_dns_provider(tmp_path: Path) -> None:
+    """Static rewrites are ensured independently for every DNS provider."""
+    primary = MockDNSProvider(
+        [DNSRecord("static.example.com", "10.0.0.99")],
+        name="primary",
+    )
+    secondary = MockDNSProvider(name="secondary")
+
+    syncer, _ = create_test_syncer_with_dns_providers(
+        tmp_path,
+        [primary, secondary],
+        proxy_instances=[make_instance("core")],
+        proxy_routes={"core": []},
+        static_rewrites={"static.example.com": "10.0.0.99"},
+    )
+
+    syncer.sync_once()
+
+    assert primary.add_calls == []
+    assert ("static.example.com", "10.0.0.99") in secondary.add_calls
+
+
+def test_sync_provider_failure_does_not_block_other_dns_providers(tmp_path: Path) -> None:
+    """A failed DNS provider write does not stop later providers from reconciling."""
+    failing = MockDNSProvider(name="failing")
+    healthy = MockDNSProvider(name="healthy")
+
+    def failing_add(domain: str, answer: str) -> bool:
+        failing.add_calls.append((domain, answer))
+        return False
+
+    failing.add_record = failing_add  # type: ignore[method-assign]
+
+    syncer, _ = create_test_syncer_with_dns_providers(
+        tmp_path,
+        [failing, healthy],
+        proxy_instances=[make_instance("core", "10.0.0.1")],
+        proxy_routes={"core": [make_route("app.example.com", "10.0.0.1")]},
+    )
+
+    syncer.sync_once()
+
+    assert ("app.example.com", "10.0.0.1") in failing.add_calls
+    assert ("app.example.com", "10.0.0.1") in healthy.add_calls
+
+
+def test_sync_skips_provider_when_records_cannot_be_read(tmp_path: Path) -> None:
+    """A read failure does not make a provider look empty and writable."""
+    unreadable = MockDNSProvider(name="unreadable")
+    healthy = MockDNSProvider(name="healthy")
+
+    def failing_get_records() -> List[DNSRecord]:
+        raise DNSProviderReadError("read failed")
+
+    unreadable.get_records = failing_get_records  # type: ignore[method-assign]
+
+    syncer, _ = create_test_syncer_with_dns_providers(
+        tmp_path,
+        [unreadable, healthy],
+        proxy_instances=[make_instance("core", "10.0.0.1")],
+        proxy_routes={"core": [make_route("app.example.com", "10.0.0.1")]},
+    )
+
+    syncer.sync_once()
+
+    assert unreadable.add_calls == []
+    assert ("app.example.com", "10.0.0.1") in healthy.add_calls
+
+
+# =============================================================================
 # Graceful Degradation Tests
 # =============================================================================
 
@@ -940,6 +1189,28 @@ def test_sync_preserves_preexisting_records_when_proxy_wants_different_ip(tmp_pa
     assert records.get("app.example.com") == "192.168.1.100"
 
 
+def test_sync_takes_over_preexisting_records_when_enabled(tmp_path: Path) -> None:
+    """Configured takeover should replace unmanaged records with desired proxy answers."""
+    initial_records = [DNSRecord("app.example.com", "192.168.1.100")]
+    instances = [make_instance("core", target_ip="10.0.0.1")]
+    routes = {"core": [make_route("app.example.com", "10.0.0.1")]}
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        dns_records=initial_records,
+        proxy_instances=instances,
+        proxy_routes=routes,
+        takeover_existing_records=True,
+    )
+
+    syncer.sync_once()
+
+    assert ("app.example.com", "192.168.1.100") in dns.delete_calls
+    assert ("app.example.com", "10.0.0.1") in dns.add_calls
+    records = {r.domain: r.answer for r in dns.get_records()}
+    assert records.get("app.example.com") == "10.0.0.1"
+
+
 def test_sync_preserves_preexisting_excluded_records(tmp_path: Path) -> None:
     """Pre-existing records matching exclusion patterns should NOT be deleted."""
     initial_records = [DNSRecord("auth.example.com", "10.0.0.1")]
@@ -1057,3 +1328,255 @@ def test_sync_managed_records_tracked_across_syncs(tmp_path: Path) -> None:
 
     # Should be deleted because it's managed
     assert ("app.example.com", "10.0.0.1") in dns2.delete_calls
+
+
+def test_sync_managed_records_are_provider_scoped(tmp_path: Path) -> None:
+    """One provider's managed record does not authorize deletion in another provider."""
+    primary = MockDNSProvider(
+        [DNSRecord("app.example.com", "10.0.0.1")],
+        name="primary",
+    )
+    secondary = MockDNSProvider(
+        [DNSRecord("app.example.com", "10.0.0.1")],
+        name="secondary",
+    )
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {"core": {"last_success": 0, "last_error": "", "url": "http://core:8080"}},
+            "domains": {
+                "app.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 0}}}
+            },
+            "managed_records_by_provider": {
+                "primary:mock://primary": {"app.example.com": ["10.0.0.1"]}
+            },
+            "managed_records": {"app.example.com": ["10.0.0.1"]},
+        }
+    )
+    proxy_provider = MockProxyProvider(
+        instances=[make_instance("core")],
+        routes_by_instance={"core": []},
+    )
+    syncer = ExternalDNSSyncer(
+        dns_providers=[primary, secondary],
+        proxy_provider=proxy_provider,
+        state_store=state_store,
+        static_rewrites={},
+        exclude_patterns=[],
+    )
+
+    syncer.sync_once()
+
+    assert ("app.example.com", "10.0.0.1") in primary.delete_calls
+    assert ("app.example.com", "10.0.0.1") not in secondary.delete_calls
+    assert {r.domain: r.answer for r in secondary.get_records()}["app.example.com"] == "10.0.0.1"
+
+
+def test_sync_reads_legacy_managed_records_without_provider_state(tmp_path: Path) -> None:
+    """Legacy managed_records state remains eligible for cleanup before migration."""
+    initial_records = [DNSRecord("app.example.com", "10.0.0.1")]
+    instances = [make_instance("core")]
+    routes: Dict[str, List[ProxyRoute]] = {"core": []}
+    StateStore(str(tmp_path / "state.json")).save(
+        {
+            "version": 1,
+            "instances": {"core": {"last_success": 0, "last_error": "", "url": "http://core:8080"}},
+            "domains": {
+                "app.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 0}}}
+            },
+            "managed_records": {"app.example.com": ["10.0.0.1"]},
+        }
+    )
+
+    syncer, dns, _ = create_test_syncer(
+        tmp_path,
+        dns_records=initial_records,
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+
+    syncer.sync_once()
+
+    assert ("app.example.com", "10.0.0.1") in dns.delete_calls
+
+
+def test_sync_migrates_all_legacy_managed_records_before_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Legacy state migration is complete before the first provider-scoped mark."""
+    initial_records = [
+        DNSRecord("app.example.com", "10.0.0.1"),
+        DNSRecord("api.example.com", "10.0.0.2"),
+    ]
+    instances = [make_instance("core")]
+    routes = {
+        "core": [
+            make_route("app.example.com", "10.0.0.1"),
+            make_route("api.example.com", "10.0.0.3"),
+        ]
+    }
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {"core": {"last_success": 0, "last_error": "", "url": "http://core:8080"}},
+            "domains": {
+                "app.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 0}}},
+                "api.example.com": {"sources": {"core": {"answer": "10.0.0.2", "last_seen": 0}}},
+            },
+            "managed_records": {
+                "app.example.com": ["10.0.0.1"],
+                "api.example.com": ["10.0.0.2"],
+            },
+        }
+    )
+    dns = MockDNSProvider(initial_records=initial_records)
+    proxy_provider = MockProxyProvider(instances=instances, routes_by_instance=routes)
+    syncer = ExternalDNSSyncer(
+        dns_provider=dns,
+        proxy_provider=proxy_provider,
+        state_store=state_store,
+        static_rewrites={},
+        exclude_patterns=[],
+    )
+
+    syncer.sync_once()
+
+    records = {record.domain: record.answer for record in dns.get_records()}
+    assert records["app.example.com"] == "10.0.0.1"
+    assert records["api.example.com"] == "10.0.0.3"
+    assert ("api.example.com", "10.0.0.2") in dns.delete_calls
+    assert ("api.example.com", "10.0.0.3") in dns.add_calls
+    state = state_store.load()
+    provider_key = syncer._provider_state_key(dns)
+    assert state["managed_records_by_provider"][provider_key] == {
+        "app.example.com": ["10.0.0.1"],
+        "api.example.com": ["10.0.0.3"],
+    }
+
+
+def test_sync_merges_legacy_records_into_partial_provider_state(tmp_path: Path) -> None:
+    """Partial provider-scoped state still adopts remaining legacy-managed records."""
+    initial_records = [
+        DNSRecord("app.example.com", "10.0.0.1"),
+        DNSRecord("api.example.com", "10.0.0.2"),
+    ]
+    instances = [make_instance("core")]
+    routes: Dict[str, List[ProxyRoute]] = {"core": []}
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {"core": {"last_success": 0, "last_error": "", "url": "http://core:8080"}},
+            "domains": {
+                "app.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 0}}},
+                "api.example.com": {"sources": {"core": {"answer": "10.0.0.2", "last_seen": 0}}},
+            },
+            "managed_records_by_provider": {
+                "MockDNS:mock://MockDNS": {"app.example.com": ["10.0.0.1"]}
+            },
+            "managed_records": {
+                "app.example.com": ["10.0.0.1"],
+                "api.example.com": ["10.0.0.2"],
+            },
+        }
+    )
+    dns = MockDNSProvider(initial_records=initial_records)
+    proxy_provider = MockProxyProvider(instances=instances, routes_by_instance=routes)
+    syncer = ExternalDNSSyncer(
+        dns_provider=dns,
+        proxy_provider=proxy_provider,
+        state_store=state_store,
+        static_rewrites={},
+        exclude_patterns=[],
+    )
+
+    syncer.sync_once()
+
+    assert ("app.example.com", "10.0.0.1") in dns.delete_calls
+    assert ("api.example.com", "10.0.0.2") in dns.delete_calls
+
+
+def test_reload_runtime_config_resets_removed_source_cleanup(tmp_path: Path) -> None:
+    """Reloaded sources trigger removed-instance cleanup on the immediate sync."""
+    initial_records = [DNSRecord("app.example.com", "10.0.0.1")]
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {"core": {"last_success": 0, "last_error": "", "url": "http://core:8080"}},
+            "domains": {
+                "app.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 0}}}
+            },
+            "managed_records": {"app.example.com": ["10.0.0.1"]},
+        }
+    )
+    dns = MockDNSProvider(initial_records=initial_records)
+    syncer = ExternalDNSSyncer(
+        dns_provider=dns,
+        proxy_provider=MockProxyProvider(
+            instances=[make_instance("core")],
+            routes_by_instance={"core": [make_route("app.example.com")]},
+        ),
+        state_store=state_store,
+        static_rewrites={},
+        exclude_patterns=[],
+    )
+    syncer._startup_cleanup_done = True
+    reloaded_proxy = MockProxyProvider(instances=[], routes_by_instance={})
+
+    _apply_runtime_config_to_syncer(
+        syncer,
+        dns_providers=[dns],
+        proxy_provider=reloaded_proxy,
+        settings=RuntimeSettings(),
+        instances=[],
+    )
+    syncer.sync_once()
+
+    assert ("app.example.com", "10.0.0.1") in dns.delete_calls
+
+
+def test_reload_runtime_config_updates_static_rewrites_and_exclusions(tmp_path: Path) -> None:
+    """Reloaded static rewrites and exclusions are applied without restart."""
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {},
+            "domains": {
+                "blocked.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 0}}}
+            },
+            "managed_records": {"blocked.example.com": ["10.0.0.1"]},
+        }
+    )
+    dns = MockDNSProvider([DNSRecord("blocked.example.com", "10.0.0.1")])
+    syncer = ExternalDNSSyncer(
+        dns_provider=dns,
+        proxy_provider=MockProxyProvider(instances=[], routes_by_instance={}),
+        state_store=state_store,
+        static_rewrites={},
+        exclude_patterns=[],
+    )
+    syncer._startup_cleanup_done = True
+    settings = RuntimeSettings(
+        static_rewrites={"static.example.com": ""},
+        exclude_domains="blocked.example.com",
+    )
+    reloaded_instances = [make_instance("core", "10.0.0.55")]
+
+    _apply_runtime_config_to_syncer(
+        syncer,
+        dns_providers=[dns],
+        proxy_provider=MockProxyProvider(
+            instances=reloaded_instances, routes_by_instance={"core": []}
+        ),
+        settings=settings,
+        instances=reloaded_instances,
+    )
+    syncer.sync_once()
+
+    assert syncer.static_rewrites == {"static.example.com": "10.0.0.55"}
+    assert ("static.example.com", "10.0.0.55") in dns.add_calls
+    assert ("blocked.example.com", "10.0.0.1") in dns.delete_calls
