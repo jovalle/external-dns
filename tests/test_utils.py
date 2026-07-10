@@ -462,6 +462,7 @@ def test_create_dns_provider_error_message_includes_suggestions() -> None:
         assert "invalid_provider" in error_message
         assert "adguard" in error_message.lower()  # supported provider
         assert "technitium" in error_message.lower()  # supported provider
+        assert "goku" in error_message.lower()  # supported provider
         assert "DNS_PROVIDER" in error_message  # env var hint
     finally:
         # Restore original value
@@ -471,7 +472,7 @@ def test_create_dns_provider_error_message_includes_suggestions() -> None:
 def test_create_dns_providers_loads_multiple_yaml_entries(monkeypatch, tmp_path: Path) -> None:
     """YAML providers entries create one concrete DNS provider per entry."""
     from external_dns import cli
-    from external_dns.cli import AdGuardDNSProvider, TechnitiumDNSProvider
+    from external_dns.cli import AdGuardDNSProvider, GokuProvider, TechnitiumDNSProvider
 
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -492,6 +493,10 @@ providers:
     url: http://technitium-b.local
     api_token: token-b
     zones: internal.example.com
+  - name: golinks
+    provider: goku
+    url: http://goku.local
+    api_token: goku-token
 sources:
   - name: core
     url: http://traefik.local
@@ -503,12 +508,15 @@ sources:
 
     providers = cli.create_dns_providers()
 
-    assert len(providers) == 3
+    assert len(providers) == 4
     assert isinstance(providers[0], AdGuardDNSProvider)
     assert isinstance(providers[1], TechnitiumDNSProvider)
     assert isinstance(providers[2], TechnitiumDNSProvider)
+    assert isinstance(providers[3], GokuProvider)
     assert providers[1]._url == "http://technitium-a.local"
     assert providers[2]._zones == ["internal.example.com"]
+    assert providers[3]._url == "http://goku.local"
+    assert providers[3].configured_name == "golinks"
 
 
 def test_validate_config_reports_each_invalid_yaml_provider(
@@ -543,7 +551,7 @@ sources:
     assert cli.validate_config() is False
     log_text = caplog.text
     assert "unsupported-target" in log_text
-    assert "Supported: adguard, technitium" in log_text
+    assert "Supported: adguard, technitium, goku" in log_text
     assert "missing-technitium-fields" in log_text
     assert "api_token" in log_text
     assert "zones" in log_text

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from external_dns.cli import DNSZone, ProxyInstance, TraefikProxyProvider
+from external_dns.cli import DNSZone, ProxyInstance, RouteSourceReadError, TraefikProxyProvider
 
 
 class TestTraefikInstanceLoadingFromYaml:
@@ -16,8 +16,7 @@ class TestTraefikInstanceLoadingFromYaml:
     def test_get_instances_from_yaml_config(self, tmp_path: Path) -> None:
         """Test loading instances from YAML config file."""
         config_file = tmp_path / "config.yaml"
-        config_file.write_text(
-            """
+        config_file.write_text("""
 sources:
   - name: core
     url: http://traefik:8080
@@ -29,8 +28,7 @@ sources:
     target_ip: 10.0.0.3
     public_target_ip: "  203.0.113.10  "
     verify_tls: false
-"""
-        )
+""")
 
         provider = TraefikProxyProvider(config_path=str(config_file))
         instances = provider.get_instances()
@@ -51,8 +49,7 @@ sources:
     def test_get_instances_skips_invalid_entries(self, tmp_path: Path) -> None:
         """Test that entries with missing required fields are skipped."""
         config_file = tmp_path / "config.yaml"
-        config_file.write_text(
-            """
+        config_file.write_text("""
 sources:
   - name: valid
     url: http://traefik:8080
@@ -62,8 +59,7 @@ sources:
   - name: missing_ip
     url: http://traefik2:8080
   - not_a_dict
-"""
-        )
+""")
 
         provider = TraefikProxyProvider(config_path=str(config_file))
         instances = provider.get_instances()
@@ -74,13 +70,11 @@ sources:
     def test_invalid_yaml_sources_do_not_fallback_to_json_env(self, tmp_path: Path) -> None:
         """A configured YAML sources section takes precedence even when invalid."""
         config_file = tmp_path / "config.yaml"
-        config_file.write_text(
-            """
+        config_file.write_text("""
 sources:
   - name: missing_url
     target_ip: 10.0.0.3
-"""
-        )
+""")
         json_config = json.dumps(
             [{"name": "env", "url": "http://traefik-env:8080", "target_ip": "10.0.0.9"}]
         )
@@ -182,6 +176,8 @@ class TestTraefikRouteDiscovery:
             assert routes[0].hostname == "app.example.com"
             assert routes[0].source_name == "test"
             assert routes[0].target_ip == "10.0.0.1"
+            assert routes[0].golink_alias == "app"
+            assert routes[0].golink_destination == "https://app.example.com"
 
     def test_get_routes_handles_multiple_routers(self) -> None:
         """Test extracting hostnames from multiple routers."""
@@ -206,16 +202,290 @@ class TestTraefikRouteDiscovery:
             hostnames = {r.hostname for r in routes}
             assert hostnames == {"app1.example.com", "app2.example.com", "app3.example.com"}
 
-    def test_get_routes_returns_empty_on_connection_error(self) -> None:
-        """Test that connection error raises exception (let caller handle)."""
+    def test_get_routes_prefers_service_name_for_golink_alias(self) -> None:
+        """GoLink alias comes from service identity while destination is the FQDN."""
         provider = TraefikProxyProvider()
         instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
 
+        mock_routers = [
+            {
+                "name": "websecure-immich@docker",
+                "service": "immich@docker",
+                "rule": "Host(`photos.example.com`)",
+            },
+        ]
+
         with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert len(routes) == 1
+            assert routes[0].golink_alias == "immich"
+            assert routes[0].golink_aliases == ["immich", "photos"]
+            assert routes[0].golink_destination == "https://photos.example.com"
+
+    def test_get_routes_adds_service_and_hostname_golink_aliases(self) -> None:
+        """Different service and hostname basenames both become GoLink aliases."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="nexus", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        mock_routers = [
+            {
+                "name": "websecure-kromgo@docker",
+                "service": "10-kromgo-service-nexus@docker",
+                "rule": "Host(`stat.example.com`)",
+            },
+            {
+                "name": "websecure-garage-s3@docker",
+                "service": "garage-s3@docker",
+                "rule": "Host(`s3.example.com`)",
+            },
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            aliases_by_hostname = {route.hostname: route.golink_aliases for route in routes}
+            assert aliases_by_hostname["stat.example.com"] == ["kromgo", "stat"]
+            assert aliases_by_hostname["s3.example.com"] == ["garage-s3", "s3"]
+
+    def test_get_routes_strips_source_stack_suffix_from_service_alias(self) -> None:
+        """Unique services do not inherit source or stack suffixes in GoLink aliases."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="nexus", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        mock_routers = [
+            {
+                "name": "websecure-dozzle@docker",
+                "service": "dozzle-nexus@docker",
+                "rule": "Host(`dozzle.example.com`)",
+                "labels": {"com.docker.compose.project": "nexus"},
+            },
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert len(routes) == 1
+            assert routes[0].golink_aliases == ["dozzle"]
+
+    def test_get_routes_collapses_truenas_ix_service_alias(self) -> None:
+        """TrueNAS ix generated service names do not become duplicate GoLink aliases."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="nexus", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        mock_routers = [
+            {
+                "name": "websecure-scrutiny@docker",
+                "service": "scrutiny-ix-scrutiny@docker",
+                "rule": "Host(`scrutiny.example.com`)",
+            },
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert len(routes) == 1
+            assert routes[0].golink_aliases == ["scrutiny"]
+            assert routes[0].golink_destination == "https://scrutiny.example.com"
+
+    def test_get_routes_strips_entrypoint_prefix_from_router_fallback(self) -> None:
+        """Router fallback removes common entrypoint prefixes when service is unavailable."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        mock_routers = [
+            {"name": "websecure-sonarr@docker", "rule": "Host(`sonarr.example.com`)"},
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert len(routes) == 1
+            assert routes[0].golink_alias == "sonarr"
+
+    def test_get_routes_keeps_one_golink_for_router_with_multiple_hostnames(self) -> None:
+        """One router can expose many DNS names without creating GoLink alias conflicts."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        mock_routers = [
+            {
+                "name": "websecure-technitium@docker",
+                "service": "technitium@docker",
+                "rule": "Host(`ns1.example.com`, `technitium.example.com`)",
+            },
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert {route.hostname for route in routes} == {
+                "ns1.example.com",
+                "technitium.example.com",
+            }
+            enabled_routes = [route for route in routes if route.golink_enabled]
+            assert len(enabled_routes) == 2
+            aliases = {
+                alias: route.golink_destination
+                for route in enabled_routes
+                for alias in route.golink_aliases
+            }
+            assert aliases == {
+                "ns1": "https://ns1.example.com",
+                "technitium": "https://technitium.example.com",
+            }
+
+    def test_get_routes_keeps_one_golink_for_service_with_multiple_routers(self) -> None:
+        """One service can have many routers without publishing many GoLink destinations."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        mock_routers = [
+            {
+                "name": "web-sonarr@docker",
+                "service": "sonarr@docker",
+                "rule": "Host(`sonarr.local.example.com`)",
+            },
+            {
+                "name": "websecure-sonarr@docker",
+                "service": "sonarr@docker",
+                "rule": "Host(`sonarr.example.com`)",
+            },
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert {route.hostname for route in routes} == {
+                "sonarr.local.example.com",
+                "sonarr.example.com",
+            }
+            enabled_routes = [route for route in routes if route.golink_enabled]
+            assert len(enabled_routes) == 1
+            assert enabled_routes[0].golink_alias == "sonarr"
+            assert enabled_routes[0].golink_destination == "https://sonarr.example.com"
+
+    def test_get_routes_uses_golink_alias_template(self) -> None:
+        """Source alias templates namespace overlapping app names."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(
+            name="nexus",
+            url="http://traefik:8080",
+            target_ip="10.0.0.1",
+            golink_alias_template="{app}-{source}",
+        )
+
+        mock_routers = [
+            {"name": "traefik-internal@docker", "rule": "Host(`traefik.nexus.example.com`)"},
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert len(routes) == 1
+            assert routes[0].golink_alias == "traefik-nexus"
+            assert routes[0].golink_destination == "https://traefik.nexus.example.com"
+
+    def test_get_routes_uses_explicit_golink_label_when_present(self) -> None:
+        """Explicit GoLink labels override router-name derivation when exposed."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        mock_routers = [
+            {
+                "name": "photos@docker",
+                "rule": "Host(`photos.example.com`)",
+                "labels": {"external-dns.golink.alias": "immich"},
+            },
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert len(routes) == 1
+            assert routes[0].golink_alias == "immich"
+
+    def test_get_routes_disables_golink_with_middleware(self) -> None:
+        """Configured opt-out middleware disables only GoLink publication metadata."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        mock_routers = [
+            {
+                "name": "admin@docker",
+                "rule": "Host(`admin.example.com`)",
+                "middlewares": ["no-golink@docker"],
+            },
+        ]
+
+        with patch("requests.Session.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = mock_routers
+            mock_get.return_value = mock_response
+
+            routes = provider.get_routes(instance)
+
+            assert len(routes) == 1
+            assert routes[0].golink_enabled is False
+
+    def test_get_routes_leaves_connection_error_logging_to_caller(self, caplog) -> None:
+        """The orchestration boundary logs a failed source exactly once."""
+        provider = TraefikProxyProvider()
+        instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
+
+        with patch("requests.Session.get") as mock_get, patch("time.sleep"):
             mock_get.side_effect = requests.exceptions.ConnectionError("Connection refused")
 
             with pytest.raises(requests.exceptions.RequestException):
                 provider.get_routes(instance)
+
+        assert "Failed to get routes" not in caplog.text
 
 
 class TestTraefikRouterFilter:
@@ -504,6 +774,12 @@ class TestTraefikHostnameExtraction:
         hostnames = provider._extract_hostnames("")
         assert hostnames == []
 
+    def test_extract_hostnames_rejects_path_like_values(self) -> None:
+        """Host values containing paths are not valid DNS hostnames."""
+        provider = TraefikProxyProvider()
+        hostnames = provider._extract_hostnames("Host(`nexus/ns1.example.com`)")
+        assert hostnames == []
+
 
 class TestTraefikFilterMethods:
     """Tests for Traefik filter methods."""
@@ -555,8 +831,8 @@ class TestTraefikJSONErrorHandling:
             with pytest.raises(json.JSONDecodeError):
                 provider.get_routes(instance)
 
-    def test_get_routes_handles_non_list_response(self) -> None:
-        """Test get_routes returns empty list if response is not a list."""
+    def test_get_routes_rejects_non_list_response(self) -> None:
+        """A malformed response must not masquerade as a successful empty source."""
         provider = TraefikProxyProvider()
         instance = ProxyInstance(name="test", url="http://traefik:8080", target_ip="10.0.0.1")
 
@@ -567,8 +843,8 @@ class TestTraefikJSONErrorHandling:
             mock_response.json.return_value = {"routers": []}  # Dict, not list
             mock_get.return_value = mock_response
 
-            routes = provider.get_routes(instance)
-            assert routes == []
+            with pytest.raises(RouteSourceReadError, match="expected a list"):
+                provider.get_routes(instance)
 
     def test_get_routes_skips_non_dict_routers(self) -> None:
         """Test get_routes continues processing when some router entries are invalid."""

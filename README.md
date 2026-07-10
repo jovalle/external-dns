@@ -1,19 +1,20 @@
 # external-dns
 
-Universal DNS synchronization service that syncs reverse proxy routes to DNS providers, inspired by [Kubernetes external-dns](https://github.com/kubernetes-sigs/external-dns).
+Route synchronization service that publishes reverse proxy routes to DNS and other targets, inspired by [Kubernetes external-dns](https://github.com/kubernetes-sigs/external-dns).
 
 ## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f4a1/512.gif" width="32" height="32" alt="light bulb"> Overview
 
-external-dns automatically discovers hostnames from your reverse proxy configuration and creates corresponding DNS records in your DNS provider. When routes are added, modified, or removed from the reverse proxy, DNS records are automatically synchronized.
+external-dns automatically discovers hostnames from reverse proxy configuration and reconciles corresponding records in each configured provider. DNS providers receive address records; Goku receives golink aliases.
 
 ## <img src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f680/512.gif" width="32" height="32" alt="rocket"> Supported Providers
 
-### DNS Providers
+### Providers (DNS and other)
 
 | Provider     | Status    | Environment Prefix |
 | ------------ | --------- | ------------------ |
 | AdGuard Home | Supported | `ADGUARD_`         |
 | CoreDNS      | Candidate | -                  |
+| Goku         | Supported | `GOKU_`            |
 | Pi-hole      | Candidate | -                  |
 | Technitium   | Supported | `TECHNITIUM_`      |
 
@@ -83,9 +84,27 @@ Treat API tokens as deployment secrets. Do not commit real token values into con
 
 Technitium API failures, invalid tokens, malformed JSON, HTTP errors, and missing records are treated as recoverable provider errors. In watch mode, external-dns logs the provider error and continues rather than crashing the process.
 
-### Multiple DNS Write Targets
+### Goku Provider
 
-YAML `providers:` entries are independent DNS write targets. external-dns reconciles each configured provider from that provider's current records, so multiple Technitium instances or mixed AdGuard and Technitium targets can be kept in sync without relying on the first provider's state.
+[Goku](https://github.com/jovalle/goku) is a self-hosted golinks service. It is configured just like any other provider, but receives alias records instead of DNS A records. See the [jovalle/goku](https://github.com/jovalle/goku) project for details on running Goku itself.
+
+```yaml
+providers:
+  - name: golinks
+    provider: goku
+    url: 'https://goku.example.com'
+    api_token: '${GOKU_API_TOKEN}'
+```
+
+Gotchas to make external-dns work with Goku:
+
+- `provider` must be `goku`. `api_token` is required.
+- Aliases come from Traefik service/router identity, not from Goku. See [golink aliases](#golink-aliases) for how names are generated and how conflicts are resolved.
+- Static DNS rewrites are not written to Goku.
+
+### Multiple Providers
+
+YAML `providers:` entries are independent providers. external-dns reconciles each provider from that provider's current records, so DNS and golink providers can be kept in sync without relying on the first provider's state.
 
 ```yaml
 providers:
@@ -103,6 +122,10 @@ providers:
     zones:
       - example.com
       - internal.example.com
+  - name: golinks
+    provider: goku
+    url: 'https://goku.example.com'
+    api_token: '${GOKU_API_TOKEN}'
 ```
 
 ### Traefik Reverse Proxy Provider
@@ -128,6 +151,8 @@ Each instance object supports:
 - `verify_tls` (optional): Verify TLS certificates (default: true)
 - `username` (optional): Basic auth username
 - `password` (optional): Basic auth password
+- `golink_alias_template` (optional): Template for Goku aliases. Supports `{app}`, `{source}`, `{hostname}`, and `{router}`. Default: `{app}`
+- `golink_exclude_middlewares` (optional): Middleware names that opt a router out of Goku alias creation. Default: `no-golink`
 
 **Single-instance configuration (legacy):**
 
@@ -135,6 +160,50 @@ Each instance object supports:
 environment:
   TRAEFIK_URL: 'http://traefik:8080'
   TRAEFIK_TARGET_IP: '192.168.1.10'
+```
+
+### Golink Aliases
+
+When a Goku provider is configured, all discovered routes are included in golinks by default. Aliases are derived from Traefik service identity first, then router identity if no service metadata is exposed. Generated service names such as `10-kromgo-service` are normalized to `kromgo`, and source/stack suffixes such as `dozzle-nexus` are normalized to `dozzle` when the source or Docker stack is named `nexus`. Common router entrypoint prefixes such as `websecure-` are stripped only for the router fallback path:
+
+```text
+websecure-garage-s3@docker + service garage-s3@docker + Host(`s3.example.com`) -> garage-s3, s3 -> https://s3.example.com
+```
+
+If one service exposes multiple hostnames through one or more routers on the same Traefik source, all hostnames remain eligible for DNS sync. The shared service alias is published once to the canonical hostname, while distinct hostname aliases are still published. Valid `Host()` values must be DNS hostnames; path-like values such as `nexus/ns1.example.com` are ignored.
+
+For overlapping sources such as `mothership` and `nexus`, use source-level templates:
+
+```yaml
+sources:
+  - name: mothership
+    type: traefik
+    url: 'https://traefik-mothership.example.com'
+    target_ip: '192.168.1.10'
+    golink_alias_template: '{app}-mothership'
+
+  - name: nexus
+    type: traefik
+    url: 'https://traefik-nexus.example.com'
+    target_ip: '192.168.1.20'
+    golink_alias_template: '{app}-nexus'
+```
+
+This maps overlapping routers as `traefik-mothership` and `traefik-nexus`. When one candidate hostname basename exactly matches the alias, that canonical destination wins (for example, `kromgo` selects `kromgo.example.com` over `stat.example.com`). Otherwise, if two routes produce the same alias with different destinations, external-dns fails closed: it skips the alias, removes any previously managed conflicting alias, and logs the exact configuration options that resolve the ambiguity.
+
+To opt a router out of golinks while keeping normal DNS sync, attach the default opt-out middleware:
+
+```yaml
+labels:
+  - 'traefik.http.routers.admin.middlewares=no-golink@docker'
+```
+
+If your Traefik API exposes labels on routers, external-dns also understands:
+
+```yaml
+labels:
+  - 'external-dns.golink.enabled=false'
+  - 'external-dns.golink.alias=immich'
 ```
 
 ### Runtime Options

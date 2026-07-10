@@ -77,6 +77,67 @@ class MockDNSProvider(DNSProvider):
         return False
 
 
+class MockGokuProvider(MockDNSProvider):
+    """Mock Goku provider that stores alias -> destination records."""
+
+    applies_domain_exclusions = False
+    conflicts_fail_closed = True
+    record_kind = "GoLink alias"
+    record_collection = "GoLink aliases"
+    key_name = "alias"
+    value_name = "destination"
+
+    def __init__(self, initial_records: List[DNSRecord] | None = None):
+        super().__init__(initial_records=initial_records, name="MockGoku")
+
+    def desired_static_record(self, domain: str, answer: str) -> DNSRecord | None:
+        return None
+
+    def desired_source_record(self, hostname: str, source: Dict[str, object]) -> DNSRecord | None:
+        if source.get("golink_enabled") is False:
+            return None
+        alias = str(source.get("golink_alias") or "").strip()
+        destination = str(source.get("golink_destination") or "").strip()
+        if not alias or not destination:
+            return None
+        return DNSRecord(alias, destination)
+
+    def desired_source_records(self, hostname: str, source: Dict[str, object]) -> List[DNSRecord]:
+        if source.get("golink_enabled") is False:
+            return []
+        destination = str(source.get("golink_destination") or "").strip()
+        if not destination:
+            return []
+        raw_aliases = source.get("golink_aliases")
+        aliases = raw_aliases if isinstance(raw_aliases, list) else [source.get("golink_alias")]
+        records: List[DNSRecord] = []
+        seen: set[str] = set()
+        for alias in aliases:
+            normalized = str(alias or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            records.append(DNSRecord(normalized, destination))
+        return records
+
+    def choose_conflicting_record(
+        self,
+        record_name: str,
+        candidates: List[tuple[str, str, str]],
+    ) -> tuple[str, str, str] | None:
+        exact = [
+            candidate
+            for candidate in candidates
+            if candidate[2].split(".", 1)[0].lower() == record_name.lower()
+        ]
+        if len(exact) == 1:
+            return exact[0]
+        return None
+
+    def conflict_hint(self) -> str:
+        return "set sources[].golink_alias_template or an explicit alias label"
+
+
 # =============================================================================
 # Mock Reverse Proxy Provider
 # =============================================================================
@@ -106,7 +167,10 @@ class MockProxyProvider(ReverseProxyProvider):
         import requests
 
         if instance.name in self._failing_instances:
-            raise requests.exceptions.RequestException(f"Instance {instance.name} unreachable")
+            raise requests.exceptions.ConnectionError(
+                f"HTTPConnectionPool(host='{instance.name}', port=8080): Max retries exceeded "
+                "(Caused by NewConnectionError: Connection refused)"
+            )
         return self._routes_by_instance.get(instance.name, [])
 
 
@@ -187,6 +251,10 @@ def make_route(
     zone: DNSZone = DNSZone.INTERNAL,
     source_name: str = "router1",
     publish_external: bool = False,
+    golink_alias: str = "",
+    golink_aliases: list[str] | None = None,
+    golink_destination: str = "",
+    golink_enabled: bool = True,
 ) -> ProxyRoute:
     """Create a ProxyRoute for testing."""
     return ProxyRoute(
@@ -196,6 +264,10 @@ def make_route(
         zone=zone,
         router_name=source_name,
         publish_external=publish_external,
+        golink_alias=golink_alias,
+        golink_aliases=golink_aliases or [],
+        golink_destination=golink_destination,
+        golink_enabled=golink_enabled,
     )
 
 
@@ -326,10 +398,10 @@ def test_sync_uses_first_instance_ip_for_conflicting_domains(tmp_path: Path) -> 
     assert records.get("app.example.com") == "10.0.0.1"
 
 
-def test_sync_preserves_record_when_one_instance_fails(tmp_path: Path) -> None:
+def test_sync_preserves_record_when_one_instance_fails(tmp_path: Path, caplog) -> None:
     """Instance unreachable should preserve records from that instance (not delete)."""
     initial_records = [DNSRecord("app.example.com", "10.0.0.1")]
-    instances = [make_instance("core", "10.0.0.1")]
+    instances = [ProxyInstance(name="core", url="http://127.0.0.1:18080", target_ip="10.0.0.1")]
     routes = {"core": [make_route("app.example.com", "10.0.0.1")]}
 
     # Pre-populate state as if a previous sync succeeded
@@ -338,7 +410,11 @@ def test_sync_preserves_record_when_one_instance_fails(tmp_path: Path) -> None:
         {
             "version": 1,
             "instances": {
-                "core": {"last_success": 1000, "last_error": "", "url": "http://core:8080"}
+                "core": {
+                    "last_success": 1000,
+                    "last_error": "",
+                    "url": "http://127.0.0.1:18080",
+                }
             },
             "domains": {
                 "app.example.com": {"sources": {"core": {"answer": "10.0.0.1", "last_seen": 1000}}}
@@ -360,6 +436,13 @@ def test_sync_preserves_record_when_one_instance_fails(tmp_path: Path) -> None:
     assert ("app.example.com", "10.0.0.1") not in dns.delete_calls
     records = {r.domain: r.answer for r in dns.get_records()}
     assert records.get("app.example.com") == "10.0.0.1"
+    source_failures = [
+        record.message for record in caplog.records if "Source 'core' unavailable" in record.message
+    ]
+    assert source_failures == [
+        "Source 'core' unavailable (Traefik at http://127.0.0.1:18080): "
+        "connection refused; check the local listener or tunnel; keeping last-known routes"
+    ]
 
 
 def test_sync_removes_orphaned_records_when_instance_removed(tmp_path: Path) -> None:
@@ -934,7 +1017,7 @@ def test_sync_provider_failure_does_not_block_other_dns_providers(tmp_path: Path
     assert ("app.example.com", "10.0.0.1") in healthy.add_calls
 
 
-def test_sync_skips_provider_when_records_cannot_be_read(tmp_path: Path) -> None:
+def test_sync_skips_provider_when_records_cannot_be_read(tmp_path: Path, caplog) -> None:
     """A read failure does not make a provider look empty and writable."""
     unreadable = MockDNSProvider(name="unreadable")
     healthy = MockDNSProvider(name="healthy")
@@ -955,6 +1038,15 @@ def test_sync_skips_provider_when_records_cannot_be_read(tmp_path: Path) -> None
 
     assert unreadable.add_calls == []
     assert ("app.example.com", "10.0.0.1") in healthy.add_calls
+    target_failures = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("[unreadable] DNS records unavailable")
+    ]
+    assert target_failures == [
+        "[unreadable] DNS records unavailable from unreadable at mock://unreadable: "
+        "read failed; record reconciliation skipped"
+    ]
 
 
 # =============================================================================
@@ -1580,3 +1672,239 @@ def test_reload_runtime_config_updates_static_rewrites_and_exclusions(tmp_path: 
     assert syncer.static_rewrites == {"static.example.com": "10.0.0.55"}
     assert ("static.example.com", "10.0.0.55") in dns.add_calls
     assert ("blocked.example.com", "10.0.0.1") in dns.delete_calls
+
+
+def test_sync_writes_goku_alias_from_route_metadata(tmp_path: Path) -> None:
+    """Goku providers receive alias -> FQDN destination records, not DNS A records."""
+    dns = MockDNSProvider(name="MockDNS")
+    goku = MockGokuProvider()
+    instances = [make_instance("core")]
+    routes = {
+        "core": [
+            make_route(
+                "photos.example.com",
+                "10.0.0.1",
+                source_name="core",
+                golink_alias="immich",
+                golink_destination="https://photos.example.com",
+            )
+        ]
+    }
+
+    syncer, _ = create_test_syncer_with_dns_providers(
+        tmp_path,
+        [dns, goku],
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+    syncer.sync_once()
+
+    assert ("photos.example.com", "10.0.0.1") in dns.add_calls
+    assert ("immich", "https://photos.example.com") in goku.add_calls
+
+
+def test_sync_writes_multiple_goku_aliases_from_route_metadata(tmp_path: Path) -> None:
+    """One discovered route can publish service and hostname GoLink aliases."""
+    goku = MockGokuProvider()
+    instances = [make_instance("core")]
+    routes = {
+        "core": [
+            make_route(
+                "stat.example.com",
+                source_name="core",
+                golink_alias="kromgo",
+                golink_aliases=["kromgo", "stat"],
+                golink_destination="https://stat.example.com",
+            )
+        ]
+    }
+
+    syncer, _ = create_test_syncer_with_dns_providers(
+        tmp_path,
+        [goku],
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+    syncer.sync_once()
+
+    assert ("kromgo", "https://stat.example.com") in goku.add_calls
+    assert ("stat", "https://stat.example.com") in goku.add_calls
+
+
+def test_sync_goku_duplicate_alias_same_destination_is_ok(tmp_path: Path) -> None:
+    """Overlapping sources can publish one alias when they agree on destination."""
+    goku = MockGokuProvider()
+    instances = [make_instance("mothership"), make_instance("nexus")]
+    routes = {
+        "mothership": [
+            make_route(
+                "traefik.example.com",
+                source_name="mothership",
+                golink_alias="traefik",
+                golink_destination="https://traefik.example.com",
+            )
+        ],
+        "nexus": [
+            make_route(
+                "traefik.example.com",
+                source_name="nexus",
+                golink_alias="traefik",
+                golink_destination="https://traefik.example.com",
+            )
+        ],
+    }
+
+    syncer, _ = create_test_syncer_with_dns_providers(
+        tmp_path,
+        [goku],
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+    syncer.sync_once()
+
+    assert goku.add_calls == [("traefik", "https://traefik.example.com")]
+
+
+def test_sync_goku_prefers_hostname_that_matches_alias(tmp_path: Path) -> None:
+    """A canonical hostname match resolves a service-alias collision across sources."""
+    goku = MockGokuProvider()
+    instances = [make_instance("mothership"), make_instance("nexus")]
+    routes = {
+        "mothership": [
+            make_route(
+                "stat.example.com",
+                source_name="mothership",
+                golink_alias="kromgo",
+                golink_aliases=["kromgo", "stat"],
+                golink_destination="https://stat.example.com",
+            )
+        ],
+        "nexus": [
+            make_route(
+                "kromgo.example.com",
+                source_name="nexus",
+                golink_alias="kromgo",
+                golink_destination="https://kromgo.example.com",
+            )
+        ],
+    }
+
+    syncer, _ = create_test_syncer_with_dns_providers(
+        tmp_path,
+        [goku],
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+    syncer.sync_once()
+
+    assert ("kromgo", "https://kromgo.example.com") in goku.add_calls
+    assert ("stat", "https://stat.example.com") in goku.add_calls
+
+
+def test_sync_goku_duplicate_alias_conflict_is_skipped_and_managed_alias_removed(
+    tmp_path: Path, caplog
+) -> None:
+    """Same alias with different destinations is not chosen silently."""
+    goku = MockGokuProvider([DNSRecord("traefik", "https://old.example.com")])
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {},
+            "domains": {},
+            "managed_records_by_provider": {
+                "MockGoku:mock://MockGoku": {"traefik": ["https://old.example.com"]}
+            },
+        }
+    )
+    instances = [make_instance("mothership"), make_instance("nexus")]
+    routes = {
+        "mothership": [
+            make_route(
+                "traefik.mothership.example.com",
+                source_name="mothership",
+                golink_alias="traefik",
+                golink_destination="https://traefik.mothership.example.com",
+            )
+        ],
+        "nexus": [
+            make_route(
+                "traefik.nexus.example.com",
+                source_name="nexus",
+                golink_alias="traefik",
+                golink_destination="https://traefik.nexus.example.com",
+            )
+        ],
+    }
+    proxy = MockProxyProvider(instances=instances, routes_by_instance=routes)
+    syncer = ExternalDNSSyncer(
+        dns_providers=[goku],
+        proxy_provider=proxy,
+        state_store=state_store,
+        static_rewrites={},
+        exclude_patterns=[],
+    )
+
+    syncer.sync_once()
+
+    assert goku.add_calls == []
+    assert ("traefik", "https://old.example.com") in goku.delete_calls
+    assert "Ambiguous golink alias 'traefik'" in caplog.text
+    assert "golink_alias_template" in caplog.text
+
+
+def test_sync_removes_owned_record_absent_from_desired_state(tmp_path: Path) -> None:
+    """Stale cleanup follows ownership, without provider-specific conflict flags."""
+    target = MockDNSProvider([DNSRecord("orphan.example.com", "10.0.0.9")])
+    state_store = StateStore(str(tmp_path / "state.json"))
+    state_store.save(
+        {
+            "version": 1,
+            "instances": {},
+            "domains": {},
+            "managed_records_by_provider": {
+                "MockDNS:mock://MockDNS": {"orphan.example.com": ["10.0.0.9"]}
+            },
+        }
+    )
+    syncer = ExternalDNSSyncer(
+        dns_providers=[target],
+        proxy_provider=MockProxyProvider(instances=[], routes_by_instance={}),
+        state_store=state_store,
+        static_rewrites={},
+        exclude_patterns=[],
+    )
+
+    syncer.sync_once()
+
+    assert target.delete_calls == [("orphan.example.com", "10.0.0.9")]
+
+
+def test_sync_goku_route_opt_out_does_not_block_dns_record(tmp_path: Path) -> None:
+    """GoLink opt-out only affects Goku; DNS records still reconcile."""
+    dns = MockDNSProvider(name="MockDNS")
+    goku = MockGokuProvider()
+    instances = [make_instance("core")]
+    routes = {
+        "core": [
+            make_route(
+                "admin.example.com",
+                "10.0.0.5",
+                source_name="core",
+                golink_alias="admin",
+                golink_destination="https://admin.example.com",
+                golink_enabled=False,
+            )
+        ]
+    }
+
+    syncer, _ = create_test_syncer_with_dns_providers(
+        tmp_path,
+        [dns, goku],
+        proxy_instances=instances,
+        proxy_routes=routes,
+    )
+    syncer.sync_once()
+
+    assert ("admin.example.com", "10.0.0.5") in dns.add_calls
+    assert goku.add_calls == []
