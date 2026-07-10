@@ -1,6 +1,15 @@
 # CHANGELOG
 
 
+## v1.3.0 (2026-07-10)
+
+### Features
+
+* feat: add SSH tunnel support for local and direct dev ([`7806028`](https://github.com/jovalle/external-dns/commit/780602842a13d92a1a896b777a00190f6c771576))
+
+* feat: add Goku provider ([`073de13`](https://github.com/jovalle/external-dns/commit/073de1390ecd4e12253e36ed6d251b731acc7f42))
+
+
 ## v1.2.1 (2026-07-09)
 
 ### Bug Fixes
