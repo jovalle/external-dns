@@ -1,0 +1,20 @@
+# SSH tunnel definitions for `make run` / `make validate` / `make plan`.
+#
+# Copy this file to `ssh-tunnels.conf` (gitignored) and define your remote
+# hosts. Each non-comment line describes one SSH tunnel:
+#
+#   <ssh-host> <local-port:remote-host:remote-port> [more forwards...]
+#
+# - <ssh-host> is a Host entry from your ~/.ssh/config (or user@hostname).
+# - Each forward maps a local port to an address reachable from the SSH host,
+#   using the standard `ssh -L` syntax.
+# - Multiple forwards for the same host go on one line, separated by spaces.
+# - Blank lines and lines beginning with `#` are ignored.
+# - If ssh-tunnels.conf is absent, no tunnels are opened and the CLI runs
+#   directly against whatever CONFIG_PATH points to.
+#
+# Example: forward a Technitium API and a Traefik dashboard through one host,
+# and a second Traefik dashboard through another host.
+#
+# gateway    15380:10.0.0.2:5380  18080:127.0.0.1:8080
+# edge       28080:10.0.0.1:8080

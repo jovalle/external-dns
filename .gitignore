@@ -26,6 +26,9 @@ docker/data/
 # Production config (may contain credentials)
 docker/config/config.yaml
 
+# Local SSH tunnel definitions (may contain private host/IP details)
+ssh-tunnels.conf
+
 # Coverage
 .coverage
 htmlcov/

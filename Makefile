@@ -13,8 +13,8 @@ SERVICE ?=
 IMAGE ?= external-dns:local
 
 .PHONY: help \
-	venv install lint format test test-integration build py-build pre-commit setup \
-	run validate plan docker stack stack-dev dev docker-down docker-build start stop restart logs ps \
+	venv install lint format test test build py-build pre-commit setup \
+	run validate plan clean docker stack stack-dev dev docker-down docker-build start stop restart logs ps \
 	template templates clean
 
 ## Show this help
@@ -34,6 +34,10 @@ help:
 	@echo "  validate     Validate local config and provider connectivity (no DNS writes)"
 	@echo "  plan         Render local DNS plan against Technitium (no DNS writes)"
 	@echo "  run          Run external-dns locally and reconcile DNS records"
+	@echo "  clean Stop local SSH tunnels used by make run"
+	@echo ""
+	@echo "  Remote hosts for run/validate/plan are configured in ssh-tunnels.conf"
+	@echo "  (copy ssh-tunnels.conf.example). No tunnels are opened if it is absent."
 	@echo ""
 	@echo "Local test stack (AdGuard + Traefik + whoami + external-dns):"
 	@echo "  stack        Build image + start full local test stack (detached)"
@@ -41,7 +45,7 @@ help:
 	@echo "  dev          Build + run external-dns only in foreground"
 	@echo "  docker       Alias for stack"
 	@echo "  docker-down  Stop and remove local test stack"
-	@echo "  test-integration  Run integration tests against stack"
+	@echo "  test         Run integration tests against stack"
 	@echo ""
 	@echo "Docker compose (SERVICE optional):"
 	@echo "  start        Start containers (up -d)"
@@ -54,12 +58,6 @@ help:
 	@echo "  template     Render *.template files (uses .env if present)"
 	@echo "  clean        Remove rendered (untracked) template outputs"
 	@echo ""
-	@echo "Examples:"
-	@echo "  make install         # Setup dev environment"
-	@echo "  make plan            # Preview DNS changes locally"
-	@echo "  make run             # Reconcile DNS locally"
-	@echo "  make stack           # Start full local test stack"
-	@echo "  make logs SERVICE=external-dns"
 
 
 # ----------------------
@@ -82,7 +80,7 @@ format: venv
 test: venv
 	$(VENV)/bin/pytest
 
-test-integration: venv
+test: venv
 	EXTERNAL_DNS_RUN_DOCKER_TESTS=1 $(VENV)/bin/pytest -o addopts= -vv -s -rA --maxfail=1 tests/integration
 
 py-build: venv lint format
@@ -102,6 +100,12 @@ setup: pre-commit
 # ----------------------
 
 LOCAL_CLI_ARGS ?=
+# SSH tunnel definitions live in a gitignored config file so remote host details
+# stay out of version control. Copy ssh-tunnels.conf.example to ssh-tunnels.conf
+# and define one tunnel per line:
+#   <ssh-host> <local-port:remote-host:remote-port> [more forwards...]
+SSH_TUNNELS_CONFIG ?= ssh-tunnels.conf
+TUNNEL_CONTROL_PREFIX ?= /tmp/external-dns-tunnel
 
 validate: LOCAL_CLI_ARGS := --validate-config
 validate: run
@@ -111,22 +115,28 @@ plan: run
 
 run: venv
 	@set -e; \
+	hosts=""; \
 	cleanup() { \
-		ssh -S /tmp/external-dns-nexus-tunnel -O exit nexus >/dev/null 2>&1 || true; \
-		ssh -S /tmp/external-dns-mothership-tunnel -O exit mothership >/dev/null 2>&1 || true; \
+		for h in $$hosts; do \
+			ssh -S "$(TUNNEL_CONTROL_PREFIX)-$$h" -O exit "$$h" >/dev/null 2>&1 || true; \
+		done; \
 	}; \
 	trap cleanup EXIT INT TERM; \
-	ssh -fN -M -S /tmp/external-dns-nexus-tunnel \
-		-L 15380:100.100.1.2:5380 \
-		-L 18080:127.0.0.1:8080 \
-		-o ExitOnForwardFailure=yes \
-		-o BatchMode=yes \
-		-o ConnectTimeout=8 nexus; \
-	ssh -fN -M -S /tmp/external-dns-mothership-tunnel \
-		-L 28080:100.100.1.1:8080 \
-		-o ExitOnForwardFailure=yes \
-		-o BatchMode=yes \
-		-o ConnectTimeout=8 mothership; \
+	if [ -f "$(SSH_TUNNELS_CONFIG)" ]; then \
+		while IFS= read -r line || [ -n "$$line" ]; do \
+			case "$$line" in ''|\#*) continue;; esac; \
+			set -- $$line; \
+			host="$$1"; shift; \
+			ctl="$(TUNNEL_CONTROL_PREFIX)-$$host"; \
+			fwd_args=""; \
+			for f in "$$@"; do fwd_args="$$fwd_args -L $$f"; done; \
+			ssh -fN -M -S "$$ctl" $$fwd_args \
+				-o ExitOnForwardFailure=yes \
+				-o BatchMode=yes \
+				-o ConnectTimeout=8 "$$host"; \
+			hosts="$$hosts $$host"; \
+		done < "$(SSH_TUNNELS_CONFIG)"; \
+	fi; \
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	unset EXTERNAL_DNS_WEBHOOK_URL EXTERNAL_DNS_WEBHOOK_USERNAME EXTERNAL_DNS_WEBHOOK_PASSWORD \
 		EXTERNAL_DNS_WEBHOOK_METHOD EXTERNAL_DNS_WEBHOOK_TIMEOUT \
@@ -134,6 +144,16 @@ run: venv
 	CONFIG_PATH="$${CONFIG_PATH:-$(CURDIR)/docker/config/config.yaml}" \
 	STATE_PATH="$${STATE_PATH:-$(CURDIR)/docker/data/state.json}" \
 	$(PYTHON) -m external_dns.cli $(LOCAL_CLI_ARGS)
+
+clean:
+	@if [ -f "$(SSH_TUNNELS_CONFIG)" ]; then \
+		while IFS= read -r line || [ -n "$$line" ]; do \
+			case "$$line" in ''|\#*) continue;; esac; \
+			set -- $$line; \
+			ssh -S "$(TUNNEL_CONTROL_PREFIX)-$$1" -O exit "$$1" >/dev/null 2>&1 || true; \
+		done < "$(SSH_TUNNELS_CONFIG)"; \
+	fi
+	@echo "Stopped external-dns SSH tunnels if they were running."
 
 
 # ----------------------
