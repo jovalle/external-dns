@@ -42,7 +42,7 @@ services:
       - --providers.docker.exposedbydefault=false
       - --entrypoints.web.address=:80
     container_name: ${TRAEFIK_CONTAINER_NAME:-traefik}
-    image: ${TRAEFIK_IMAGE:-traefik:v3.6.4}
+    image: ${TRAEFIK_IMAGE:-traefik:v3.7.17}
     networks:
       backend:
         ipv4_address: ${TRAEFIK_IP:-172.52.0.11}
