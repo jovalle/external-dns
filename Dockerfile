@@ -5,7 +5,7 @@
 # Supports multiple DNS and reverse proxy implementations via provider plugins
 # =============================================================================
 
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 # Install runtime dependencies (from the packaged project)
 WORKDIR /app
